@@ -134,6 +134,9 @@ import {
   diagnoseLaunchdPlistPaths,
   isDetached,
   pickInstancePid,
+  plistCarriesInlineAdminPassword,
+  readLaunchctlJobState,
+  readPlistProgramRefs,
   renderDetachedWarning,
   LAUNCHCTL_QUERY_TIMEOUT_MS,
   type LaunchctlLister,
@@ -144,6 +147,8 @@ import {
   planLaunchdRepair,
   mapRepairThrow,
   decideAdoptStop,
+  verifyAdoptServing,
+  type AdminPassAvailability,
   type LaunchdRepairResult,
   type RepairPlan,
 } from "./lib/launchd-repair.js";
@@ -507,24 +512,24 @@ export interface LaunchdPlistOptions {
   /** HARPER_SET_CONFIG payload; already JSON-stringified by the caller. */
   setConfig: string;
   adminUser: string;
-  /**
-   * HDB_ADMIN_PASSWORD value for inline mode. IGNORED in pass-file mode (the
-   * password is read from `passFile.adminPassFile` at start time) — pass an
-   * empty string there.
-   */
-  adminPass: string;
   httpPort: number | string;
   /** OPERATIONSAPI_NETWORK_PORT value from opsNetworkPortValue(). */
   opsNetworkPort: string;
   /**
-   * Opt-in secret-free mode (flair#1573 slice a). When present, the plist does
-   * NOT embed HDB_ADMIN_PASSWORD inline: ProgramArguments point at `launcher`,
-   * which reads the password from `adminPassFile` (a 0600 file) at start time.
-   * `home` and `path` are the HOME/PATH the launcher needs under launchd's
-   * minimal environment to start Harper non-interactively. Absent => the
-   * existing inline behavior (unchanged for current `flair init` callers).
+   * The pass-file launcher (flair#1573 slice a) — REQUIRED (flair#1693).
+   *
+   * There is no inline mode. The plist NEVER embeds HDB_ADMIN_PASSWORD:
+   * ProgramArguments point at `launcher`, which reads the password from
+   * `adminPassFile` (a 0600 file) at start time. `home` and `path` are the
+   * HOME/PATH the launcher needs under launchd's minimal environment to start
+   * Harper non-interactively.
+   *
+   * This is required so an inline plist (the shape `flair init` used to write,
+   * putting the admin password into a config file) cannot be constructed at
+   * all — a caller without a satisfiable pass file is a compile error, not a
+   * silently downgraded plist (flair#1693, incident flair#1685).
    */
-  passFile?: {
+  passFile: {
     /** Absolute path to the product launcher script. */
     launcher: string;
     /** Absolute path to the 0600 admin-pass file. */
@@ -553,28 +558,20 @@ export function buildLaunchdPlist(opts: LaunchdPlistOptions): string {
   const e = escapeXml;
   const passFile = opts.passFile;
 
-  // ProgramArguments: inline mode execs node directly; pass-file mode execs
-  // the launcher, which reads the secret from a 0600 file and then execs node
-  // itself (so launchd still tracks Harper as the job).
-  const programArguments = passFile
-    ? `<array>
+  // ProgramArguments: exec the launcher, which reads the secret from a 0600
+  // file and then execs node itself (so launchd still tracks Harper as the
+  // job). There is deliberately no inline branch (flair#1693).
+  const programArguments = `<array>
     <string>${e(passFile.launcher)}</string>
     <string>${e(passFile.adminPassFile)}</string>
     <string>${e(opts.execPath)}</string>
     <string>${e(opts.harperBinPath)}</string>
-  </array>`
-    : `<array>
-    <string>${e(opts.execPath)}</string>
-    <string>${e(opts.harperBinPath)}</string>
-    <string>run</string>
-    <string>.</string>
   </array>`;
 
-  // EnvironmentVariables: pass-file mode drops HDB_ADMIN_PASSWORD (the secret
-  // is read from the file by the launcher) and adds HOME + PATH, which the
-  // launcher needs under launchd's minimal env to start Harper non-interactively.
-  const environmentVariables = passFile
-    ? `<dict>
+  // EnvironmentVariables: no HDB_ADMIN_PASSWORD (the secret is read from the
+  // file by the launcher), plus HOME + PATH, which the launcher needs under
+  // launchd's minimal env to start Harper non-interactively.
+  const environmentVariables = `<dict>
     <key>ROOTPATH</key><string>${e(opts.dataDir)}</string>
     <key>FLAIR_MODELS_DIR</key><string>${e(opts.modelsDir)}</string>
     <key>HARPER_SET_CONFIG</key><string>${e(opts.setConfig)}</string>
@@ -590,22 +587,6 @@ export function buildLaunchdPlist(opts: LaunchdPlistOptions): string {
     <key>MQTT_WEBSOCKET</key><string>false</string>
     <key>HOME</key><string>${e(passFile.home)}</string>
     <key>PATH</key><string>${e(passFile.path)}</string>
-  </dict>`
-    : `<dict>
-    <key>ROOTPATH</key><string>${e(opts.dataDir)}</string>
-    <key>FLAIR_MODELS_DIR</key><string>${e(opts.modelsDir)}</string>
-    <key>HARPER_SET_CONFIG</key><string>${e(opts.setConfig)}</string>
-    <key>DEFAULTS_MODE</key><string>dev</string>
-    <key>HDB_ADMIN_USERNAME</key><string>${e(opts.adminUser)}</string>
-    <key>HDB_ADMIN_PASSWORD</key><string>${e(opts.adminPass)}</string>
-    <key>THREADS_COUNT</key><string>1</string>
-    <key>NODE_HOSTNAME</key><string>localhost</string>
-    <key>HTTP_PORT</key><string>${e(String(opts.httpPort))}</string>
-    <key>OPERATIONSAPI_NETWORK_PORT</key><string>${e(opts.opsNetworkPort)}</string>
-    <key>LOCAL_STUDIO</key><string>false</string>
-    <key>MQTT_NETWORK_PORT</key><string>null</string>
-    <key>MQTT_NETWORK_SECUREPORT</key><string>null</string>
-    <key>MQTT_WEBSOCKET</key><string>false</string>
   </dict>`;
 
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -3886,7 +3867,6 @@ program.hook("preAction", async (_thisCommand, actionCommand) => {
 bindInitCli({
   api,
   b64url,
-  buildLaunchdPlist,
   buildOperationsApiConfig,
   cleanupLegacyLaunchdPlist,
   defaultDataDir,
@@ -3920,6 +3900,7 @@ bindInitCli({
   verifySemanticSearch,
   waitForHealth,
   writeDaemonSidecar,
+  writeInitLaunchdPlist,
   MQTT_DISABLED_CONFIG,
   STARTUP_TIMEOUT_MS,
 });
@@ -4900,7 +4881,6 @@ function buildRepairPlist(dataDir: string, config: Record<string, any>): string 
     modelsDir,
     setConfig,
     adminUser: DEFAULT_ADMIN_USER,
-    adminPass: "", // ignored in pass-file mode
     httpPort,
     opsNetworkPort,
     passFile: {
@@ -4910,6 +4890,260 @@ function buildRepairPlist(dataDir: string, config: Record<string, any>): string 
       path: process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin",
     },
   });
+}
+
+/**
+ * Resolve whether the pass-file launcher's argv is satisfiable (flair#1685),
+ * WITHOUT touching the network or writing anything. Pure filesystem + env:
+ *
+ *   - an existing valid 0600 non-empty file  -> reuse, never rewrite
+ *   - FLAIR_ADMIN_PASS / HDB_ADMIN_PASSWORD  -> a candidate the executor must
+ *     prove against the live instance before it may write it
+ *   - neither                                -> missing (refuse)
+ *
+ * An existing file that does not pass readSecretFileSecure (wrong mode, empty)
+ * is reported missing rather than reused: the launcher re-checks the mode at
+ * start time and would refuse the same file, so writing the plist around it
+ * would reproduce #1685 one level down.
+ */
+function resolveAdminPassAvailability(path: string): AdminPassAvailability {
+  if (existsSync(path)) {
+    try {
+      readAdminPassFileSecure(path);
+      return { kind: "existing-valid" };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        kind: "missing",
+        detail: `the admin-pass file at ${path} is unusable (${msg})`,
+      };
+    }
+  }
+  if (process.env.FLAIR_ADMIN_PASS || process.env.HDB_ADMIN_PASSWORD) {
+    return { kind: "candidate", source: "env" };
+  }
+  return {
+    kind: "missing",
+    detail:
+      `the admin-pass file at ${path} does not exist and no credential is available in the environment. ` +
+      `Run 'flair init' to provision ${path}, or start the instance and re-run 'flair doctor --fix'.`,
+  };
+}
+
+/**
+ * Prove an admin credential belongs to the running instance before adoption
+ * materializes it into the 0600 pass file (flair#1685). The admin-gated
+ * /HealthDetail read is the proof: a rejected Basic credential produces 401 and
+ * is NOT retried through the agent-key floor (that floor only engages when no
+ * credential was sent at all), so success here means THIS credential was
+ * accepted by THIS instance. Never logs the secret.
+ */
+async function proveAdminPassAgainstInstance(
+  port: number,
+  adminPass: string,
+): Promise<string | null> {
+  try {
+    await api("GET", "/HealthDetail", undefined, {
+      baseUrl: `http://127.0.0.1:${port}`,
+      explicitAdminPass: adminPass,
+    });
+    return null;
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
+}
+
+/**
+ * Validate the pass file against the launcher's OWN read contract before the
+ * plist that names it is written (flair#1685): exists, readable, owner-only
+ * (no group/other bits), non-empty. This is exactly the four checks
+ * templates/launchd/start-flair-with-admin-pass.sh runs at start time; the
+ * write side applies them so a plist is never written around a file the
+ * launcher would refuse. Returns the problem, or null when the file is safe.
+ */
+function validateAdminPassFileForLauncher(path: string): string | null {
+  try {
+    readAdminPassFileSecure(path);
+    return null;
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
+}
+
+/** Options for `writeInitLaunchdPlist` — the launchd-plist step of `flair init`. */
+export interface WriteInitLaunchdPlistOptions {
+  dataDir: string;
+  /** The label-scoped plist path resolved by the caller (launchdPlistPath). */
+  plistPath: string;
+  label: string;
+  /** The credential `flair init` resolved in-hand (generated, --admin-pass, --admin-pass-file, or env). May be "". */
+  adminPass: string;
+  adminUser: string;
+  modelsDir: string;
+  execPath: string;
+  harperBinPath: string;
+  workingDirectory: string;
+  httpPort: number | string;
+  opsNetworkPort: string;
+  setConfig: string;
+  /** The HTTP port to prove an in-hand credential against the running instance. */
+  port: number;
+  /** Override of `defaultAdminPassPath()`; tests point this at a temp dir. */
+  adminPassPath?: string;
+  /**
+   * Whether a live instance is available to prove the credential against.
+   * Defaults to true; tests that do not prove pass false (or inject `prove`).
+   */
+  liveInstance?: boolean;
+}
+
+/** Dependencies `writeInitLaunchdPlist` accepts so tests need no real network. */
+export interface WriteInitLaunchdPlistDeps {
+  /** Prove a credential against the live instance; returns an error string, or null when proven. */
+  prove?: (port: number, credential: string) => Promise<string | null>;
+}
+
+/**
+ * The outcome of init's launchd-plist step.
+ *
+ * `unchanged` and `refused` both mean NO plist write happened: the first when
+ * the instance is already adopted with the pass-file shape (flair#1693 — init
+ * must not downgrade it, and re-writing would only churn the file), the second
+ * when the launcher's argv cannot be satisfied (flair#1685).
+ */
+export type WriteInitLaunchdPlistResult =
+  | { kind: "written"; plistPath: string }
+  | { kind: "unchanged"; plistPath: string; detail: string }
+  | { kind: "refused"; detail: string };
+
+/**
+ * Write the launchd plist for `flair init`, with the SAME credential discipline
+ * as the `doctor --fix` arms (flair#1693, closing flair#1685's other half).
+ *
+ * The old `flair init` wrote an INLINE plist (ProgramArguments = [node,
+ * harper.js, run, .] + HDB_ADMIN_PASSWORD in EnvironmentVariables) unconditionally,
+ * which downgraded an instance already adopted into the flair#1573 pass-file
+ * shape and put the admin password into a config file. This function removes
+ * that path structurally (there is no inline branch left to call — `passFile`
+ * is required on `LaunchdPlistOptions`) and makes the writer own its
+ * precondition:
+ *
+ *   1. An on-disk plist that is provably ours IN THE PASS-FILE SHAPE is left
+ *      byte-for-byte unchanged. An adopted instance is never downgraded, and a
+ *      re-run of init does not churn mtime / flap launchd state.
+ *   2. A plist that is provably another instance's (`foreign`) or cannot be
+ *      attributed (`unattributable`) is refused, naming `flair doctor --fix`.
+ *   3. Otherwise, resolve the pass file BEFORE writing anything: reuse an
+ *      existing valid 0600 file; else prove the credential in hand against the
+ *      running instance and write it 0600 atomically; else refuse with the
+ *      file and the command named and write NO plist. Never a plist whose
+ *      launcher argv cannot be satisfied.
+ *
+ * The proof uses the same authed `GET /HealthDetail` as the doctor arms (a
+ * rejected Basic credential is a 401 and never falls through to the agent-key
+ * floor), so a credential that does not belong to THIS instance is refused
+ * rather than baked into a pass file the instance would reject.
+ */
+export async function writeInitLaunchdPlist(
+  opts: WriteInitLaunchdPlistOptions,
+  deps: WriteInitLaunchdPlistDeps = {},
+): Promise<WriteInitLaunchdPlistResult> {
+  const prove = deps.prove ?? proveAdminPassAgainstInstance;
+  const adminPassPath = opts.adminPassPath ?? defaultAdminPassPath();
+
+  // Already adopted: ours, pass-file shape -> leave the bytes alone (#1693).
+  if (existsSync(opts.plistPath)) {
+    let raw: string | null = null;
+    try { raw = readFileSync(opts.plistPath, "utf-8"); } catch { raw = null; }
+    if (raw !== null) {
+      const disposition = classifyPlist(opts.plistPath, opts.dataDir, {
+        exists: existsSync,
+        read: () => raw,
+        readRootPath: () => readPlistRootPath(opts.plistPath),
+      });
+      if (disposition === "foreign" || disposition === "unattributable") {
+        return {
+          kind: "refused",
+          detail:
+            `refusing to write the launchd plist at ${opts.plistPath}: ` +
+            (disposition === "foreign"
+              ? "it is registered to a different data directory, so it belongs to a different Flair instance."
+              : "it has no ROOTPATH, so it cannot be proven to belong to this instance.") +
+            " Run 'flair doctor --fix' to repair launchd management.",
+        };
+      }
+      const refs = readPlistProgramRefs(opts.plistPath, () => raw as string);
+      const launcherArg = refs?.programArguments[0] ?? "";
+      const passFileShape =
+        !plistCarriesInlineAdminPassword(raw) &&
+        basename(launcherArg) === basename(launchdLauncherPath());
+      if (disposition === "ours" && passFileShape) {
+        return {
+          kind: "unchanged",
+          plistPath: opts.plistPath,
+          detail:
+            `the launchd service is already adopted with the pass-file launcher; leaving ${opts.plistPath} unchanged`,
+        };
+      }
+    }
+  }
+
+  // Credential before plist (flair#1685): reuse an existing valid 0600 file,
+  // else prove the in-hand credential against the live instance and write it
+  // 0600, else refuse with no plist.
+  if (resolveAdminPassAvailability(adminPassPath).kind !== "existing-valid") {
+    const candidate =
+      opts.adminPass || process.env.FLAIR_ADMIN_PASS || process.env.HDB_ADMIN_PASSWORD;
+    if (!candidate) {
+      return {
+        kind: "refused",
+        detail:
+          `refusing to write the launchd plist: the admin-pass file at ${adminPassPath} does not exist and no ` +
+          "admin credential is available to provision it. Set FLAIR_ADMIN_PASS or pass --admin-pass-file <path>, " +
+          "then re-run 'flair init'.",
+      };
+    }
+    if (opts.liveInstance !== false) {
+      const proof = await prove(opts.port, candidate);
+      if (proof) {
+        return {
+          kind: "refused",
+          detail:
+            "refusing to write the launchd plist: the admin credential does not authenticate against the running " +
+            `instance (${proof}), so writing it to ${adminPassPath} would create a pass file the instance rejects. ` +
+            "Run 'flair init' with the instance's current credential.",
+        };
+      }
+    }
+    writeAdminPassFile(adminPassPath, candidate);
+  }
+
+  const passFileProblem = validateAdminPassFileForLauncher(adminPassPath);
+  if (passFileProblem) {
+    return { kind: "refused", detail: `refusing to write the launchd plist: ${passFileProblem}` };
+  }
+
+  const plist = buildLaunchdPlist({
+    label: opts.label,
+    execPath: opts.execPath,
+    harperBinPath: opts.harperBinPath,
+    workingDirectory: opts.workingDirectory,
+    dataDir: opts.dataDir,
+    modelsDir: opts.modelsDir,
+    setConfig: opts.setConfig,
+    adminUser: opts.adminUser,
+    httpPort: opts.httpPort,
+    opsNetworkPort: opts.opsNetworkPort,
+    passFile: {
+      launcher: launchdLauncherPath(),
+      adminPassFile: adminPassPath,
+      home: homedir(),
+      path: process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin",
+    },
+  });
+  // No secret is embedded (pass-file mode), so 0644 matches the doctor arm.
+  writeFileAtomic(opts.plistPath, plist, 0o644);
+  return { kind: "written", plistPath: opts.plistPath };
 }
 
 /**
@@ -4944,7 +5178,20 @@ function planLaunchdRepairFor(dataDir: string, port: number): {
   const instancePid = resolveInstanceServingPid(dataDir, port);
   const directProcessRunning = instancePid !== null && observation.state !== "managed";
 
-  const plan = planLaunchdRepair({ observation, disposition, plistPath, directProcessRunning, configReadable });
+  // Credential before plist (flair#1685): the plan may only authorize a
+  // pass-file plist whose launcher argv is satisfiable.
+  const adminPassPath = defaultAdminPassPath();
+  const adminPass = resolveAdminPassAvailability(adminPassPath);
+
+  const plan = planLaunchdRepair({
+    observation,
+    disposition,
+    plistPath,
+    directProcessRunning,
+    configReadable,
+    adminPassPath,
+    adminPass,
+  });
   return { plan, plistPath, isLegacy, config };
 }
 
@@ -4972,11 +5219,23 @@ function planLaunchdRepairFor(dataDir: string, port: number): {
  * process is refused by the liveness machine (DISAGREEMENT/UNKNOWN), never
  * signalled.
  *
+ * Credential before plist (flair#1685): the generated plist is always
+ * pass-file mode, so its launcher cannot start unless ~/.flair/admin-pass
+ * exists and is safe. An existing valid file is reused; an env credential is
+ * PROVEN against the live instance (before the adopt bounce) and only then
+ * written; nothing usable yields a refusal with no plist. The written file is
+ * validated against the launcher's own read contract (exists, mode 0600,
+ * non-empty) before load.
+ *
  * Never reports success on a direct-start fallback: the final verify is
- * assessLaunchdManagement, and anything short of `managed` is a `failed` result
- * with the detached detail + remedy, never a silent pass. The whole executor
- * arm is wrapped in try/catch (Kern's b1 defect): a throw becomes a named
- * `failed` result (or an engine-backwards `refused`), never a crash mid-report.
+ * assessLaunchdManagement (launchctl PID AND that PID is the serving process),
+ * and anything short of `managed` is a `failed` result with the detached detail
+ * + remedy, never a silent pass. On the adopt arm the verify additionally
+ * proves the serving pid CHANGED and the pre-adopt pid is dead, because port
+ * health alone is answered by the old process (flair#1684/#1685). The whole
+ * executor arm is wrapped in try/catch (Kern's b1 defect): a throw becomes a
+ * named `failed` result (or an engine-backwards `refused`), never a crash
+ * mid-report.
  */
 async function repairLaunchdManagement(dataDir: string, port: number): Promise<LaunchdRepairResult> {
   const { plan, plistPath, isLegacy, config } = planLaunchdRepairFor(dataDir, port);
@@ -4997,9 +5256,58 @@ async function repairLaunchdManagement(dataDir: string, port: number): Promise<L
         // the live instance (guard-after-stop would SIGTERM the instance and
         // then refuse, leaving it down with nothing to restart it).
         guardEngineNotBackwards(dataDir);
-        // Adopt (flair#1573 slice b2): clean-stop the direct process first, so
-        // the regenerate + load below does not collide on the port.
+        // Credential before plist (flair#1685). Resolve and, when the plan says
+        // the pass file must be materialized (an env candidate), PROVE the
+        // credential against the live instance BEFORE the adopt bounce stops
+        // it — then write the 0600 file. Refuse, with no plist and no bounce,
+        // when nothing proves.
+        const adminPassPath = defaultAdminPassPath();
+        if (plan.credential.writeAdminPassFile) {
+          const candidate = process.env.FLAIR_ADMIN_PASS ?? process.env.HDB_ADMIN_PASSWORD;
+          if (!candidate) {
+            return {
+              kind: "refused",
+              reason: "missing-credential",
+              detail:
+                `refusing to repair the launchd plist: ${adminPassPath} must be written from a credential, ` +
+                "but no credential is available in the environment.",
+              plistPath,
+            };
+          }
+          const proof = await proveAdminPassAgainstInstance(port, candidate);
+          if (proof) {
+            return {
+              kind: "refused",
+              reason: "missing-credential",
+              detail:
+                "refusing to repair the launchd plist: the credential in FLAIR_ADMIN_PASS/HDB_ADMIN_PASSWORD " +
+                `does not authenticate against the running instance (${proof}), so writing it to ` +
+                `${adminPassPath} would create a pass file the instance rejects. Run 'flair init' to provision ` +
+                "the correct credential.",
+              plistPath,
+            };
+          }
+          writeAdminPassFile(adminPassPath, candidate);
+        }
+        // Validate the pass file against the launcher's OWN read contract before
+        // any plist names it: an existing file that drifted to 0644 must refuse
+        // here, never be baked into a plist the launcher will reject at start.
+        const passFileProblem = validateAdminPassFileForLauncher(adminPassPath);
+        if (passFileProblem) {
+          return {
+            kind: "refused",
+            reason: "missing-credential",
+            detail: `refusing to repair the launchd plist: ${passFileProblem}`,
+            plistPath,
+          };
+        }
+        // Adopt (flair#1573 slice b2): capture the process serving the instance
+        // NOW (before the stop), then clean-stop it, so the regenerate + load
+        // below does not collide on the port. The captured pid is the evidence
+        // the post-load verify uses to prove the serving pid CHANGED.
+        let directPid: number | null = null;
         if (plan.kind === "adopt") {
+          directPid = resolveInstanceServingPid(dataDir, port);
           const stop = await stopDirectProcessForAdopt(port, dataDir);
           if (stop) return stop; // a named failed result
         }
@@ -5009,6 +5317,14 @@ async function repairLaunchdManagement(dataDir: string, port: number): Promise<L
         const plist = buildRepairPlist(dataDir, config!);
         const newPlistPath = launchdPlistPath(launchdLabel(dataDir));
         writeFileAtomic(newPlistPath, plist, 0o644);
+        // Validate the plist's absolute paths BEFORE launchd load (flair#1685
+        // hardening): launchctl load/start exit 0 for a job whose program is
+        // missing, so a stale launcher or node path produces a job that never
+        // starts — the same masked failure this repair exists to prevent.
+        const stalePlistPath = diagnoseLaunchdPlistPaths(newPlistPath);
+        if (stalePlistPath) {
+          return { kind: "failed", detail: stalePlistPath.message, remedy: stalePlistPath.remedy };
+        }
         // flair#1586 / #1581: a SET_CONFIG-less detach (MQTT_* via
         // buildDirectSpawnEnv) can persist mqtt.network as mtls, port,
         // securePort when Harper stored no originals for already-null ports.
@@ -5034,6 +5350,25 @@ async function repairLaunchdManagement(dataDir: string, port: number): Promise<L
         const after = observeLaunchdManagement(dataDir, port);
         if (after.state !== "managed") {
           return { kind: "failed", detail: after.detail, remedy: after.remedy };
+        }
+        // On the adopt arm, port health alone is the green light that lied in
+        // #1684: the pre-adopt direct process answered the port the whole time
+        // the launchd job was failing to start. Prove the launchd job itself
+        // serves — the old pid is dead, the serving pid changed, and it is
+        // launchd's reported pid for this label.
+        if (plan.kind === "adopt") {
+          const label = after.label ?? resolveLaunchdLabel(dataDir).label;
+          const managedPid = readLaunchctlJobState(label, realLaunchctlLister).pid;
+          const servingPid = resolveInstanceServingPid(dataDir, port);
+          const proof = verifyAdoptServing({
+            directPid,
+            managedPid,
+            servingPid,
+            directPidAlive: directPid !== null && isProcessAlive(directPid),
+          });
+          if (proof) {
+            return { kind: "failed", detail: proof.detail, remedy: ["flair stop", "flair doctor --fix"] };
+          }
         }
         const detail = plan.kind === "adopt"
           ? `adopted the direct-spawned instance into launchd (bounced the live instance): ${after.detail}`

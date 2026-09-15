@@ -41,6 +41,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
   chmodSync,
 } from "node:fs";
@@ -156,25 +157,31 @@ function stripAmbientFlair(env: NodeJS.ProcessEnv): Record<string, string> {
   return out;
 }
 
-function doctorEnv(tmpHome: string): Record<string, string> {
-  return {
+function doctorEnv(tmpHome: string, opts: { adminPassEnv?: boolean } = {}): Record<string, string> {
+  const env: Record<string, string> = {
     ...stripAmbientFlair(process.env),
     HOME: tmpHome,
     FLAIR_MODELS_DIR: MODELS_DIR,
-    HDB_ADMIN_PASSWORD: ADMIN_PASS,
-    FLAIR_ADMIN_PASS: ADMIN_PASS,
-    HDB_ADMIN_USERNAME: ADMIN_USER,
   };
+  // The adopt-with-no-pass-file case (#1685) needs the env credential present;
+  // the refusal case needs it absent, so the file cannot be created.
+  if (opts.adminPassEnv !== false) {
+    env.HDB_ADMIN_PASSWORD = ADMIN_PASS;
+    env.FLAIR_ADMIN_PASS = ADMIN_PASS;
+  }
+  env.HDB_ADMIN_USERNAME = ADMIN_USER;
+  return env;
 }
 
 async function runDoctorFix(
   tmpHome: string,
   port: number,
+  opts: { adminPassEnv?: boolean } = {},
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   requireCliBuild();
   const proc = spawn(nodeBin(), [CLI_JS, "doctor", "--fix", "--port", String(port)], {
     cwd: REPO_ROOT,
-    env: doctorEnv(tmpHome),
+    env: doctorEnv(tmpHome, opts),
     stdio: ["ignore", "pipe", "pipe"],
   });
   let stdout = "";
@@ -195,6 +202,46 @@ async function runDoctorFix(
         /* already gone */
       }
       reject(new Error(`flair doctor --fix timed out after 180s\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+    }, 180_000);
+  });
+  return { stdout, stderr, exitCode };
+}
+
+async function runInit(
+  tmpHome: string,
+  port: number,
+  extraArgs: string[] = [],
+): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  requireCliBuild();
+  const proc = spawn(
+    nodeBin(),
+    [CLI_JS, "init", "--port", String(port), "--no-mcp", "--skip-soul", ...extraArgs],
+    {
+      cwd: REPO_ROOT,
+      // No env credential: the sandbox's ~/.flair/admin-pass is the source, so
+      // this exercises the reuse leg of the resolution rather than a proof.
+      env: doctorEnv(tmpHome, { adminPassEnv: false }),
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  let stdout = "";
+  let stderr = "";
+  proc.stdout?.on("data", (d: Buffer) => {
+    stdout += d.toString();
+  });
+  proc.stderr?.on("data", (d: Buffer) => {
+    stderr += d.toString();
+  });
+  const exitCode: number = await new Promise((resolveExit, reject) => {
+    proc.on("error", reject);
+    proc.on("exit", (code) => resolveExit(code ?? 1));
+    setTimeout(() => {
+      try {
+        proc.kill("SIGTERM");
+      } catch {
+        /* already gone */
+      }
+      reject(new Error(`flair init timed out after 180s\nstdout:\n${stdout}\nstderr:\n${stderr}`));
     }, 180_000);
   });
   return { stdout, stderr, exitCode };
@@ -662,6 +709,93 @@ test.skipIf(!isDarwin)(
     expect(instancePid(sb.dataDir, sb.httpPort), "PID must stay stable after adopt (no KeepAlive restart loop)").toBe(
       managed.pid,
     );
+  },
+  TEST_TIMEOUT_MS,
+);
+
+test.skipIf(!isDarwin)(
+  "adopt with NO pass file and a proven env credential: doctor writes the 0600 file and adopts (flair#1685)",
+  async () => {
+    requireCliBuild();
+    const sb = await newSandbox();
+    const before = await snapshotBeforeFix(sb);
+    const managedPid = instancePid(sb.dataDir, sb.httpPort);
+    await stopManagedHarper(sb);
+    const detachedPid = await directSpawnDetached(sb);
+    expect(detachedPid).not.toBe(managedPid);
+    const passFile = join(sb.tmpHome, ".flair", "admin-pass");
+    // The #1685 gap: the direct-spawned instance is live, but the pass file the
+    // adopted plist's launcher needs does not exist. FLAIR_ADMIN_PASS is set to
+    // the instance's real password, so adoption must PROVE it against the live
+    // instance, write the file 0600, and only then write the plist.
+    rmSync(passFile, { force: true });
+    expect(existsSync(passFile)).toBe(false);
+    clearLaunchdLogs(sb.dataDir);
+
+    const result = await doctorFixToManaged(sb);
+    const managed = assertManaged(sb);
+    expect(existsSync(passFile), "doctor --fix must create the admin-pass file").toBe(true);
+    expect(statSync(passFile).mode & 0o777, "the created pass file must be 0600").toBe(0o600);
+    expect(readFileSync(passFile, "utf-8").replace(/\s+$/, "")).toBe(ADMIN_PASS);
+    expect(isAlive(detachedPid), `adopt must clean-stop the direct pid ${detachedPid}`).toBe(false);
+    expect(managed.pid, "serving pid must CHANGED from the direct pid").not.toBe(detachedPid);
+    assertSecretFreePlist(sb.plistPath);
+    expect(result.stdout + result.stderr).toMatch(/adopt|bounc/i);
+    await assertNoRebootstrap(sb, before);
+  },
+  TEST_TIMEOUT_MS,
+);
+
+test.skipIf(!isDarwin)(
+  "regenerate with NO pass file, no live process, and no env credential: refuse and write no plist (flair#1685)",
+  async () => {
+    requireCliBuild();
+    const sb = await newSandbox();
+    // Instance DOWN: unload the job and remove the pass file, then move the
+    // existing (valid) plist aside so any plist found after doctor --fix was
+    // provably written by it.
+    await stopManagedHarper(sb);
+    const passFile = join(sb.tmpHome, ".flair", "admin-pass");
+    rmSync(passFile, { force: true });
+    const movedAside = `${sb.plistPath}.1685-bak`;
+    rmSync(movedAside, { force: true });
+    writeFileSync(movedAside, readFileSync(sb.plistPath));
+    rmSync(sb.plistPath, { force: true });
+    expect(existsSync(passFile)).toBe(false);
+    expect(existsSync(sb.plistPath)).toBe(false);
+
+    const result = await runDoctorFix(sb.tmpHome, sb.httpPort, { adminPassEnv: false });
+    expect(result.exitCode, `${result.stdout}\n${result.stderr}`).not.toBe(0);
+    expect(existsSync(passFile), "a refusal must not create the pass file").toBe(false);
+    expect(
+      existsSync(sb.plistPath),
+      "a refusal must not leave a launchd plist whose launcher needs the missing pass file",
+    ).toBe(false);
+    expect(result.stdout + result.stderr).toMatch(/admin-pass|flair init/i);
+  },
+  TEST_TIMEOUT_MS,
+);
+
+test.skipIf(!isDarwin)(
+  "flair init on an already-adopted instance leaves the plist byte-identical (flair#1693)",
+  async () => {
+    requireCliBuild();
+    const sb = await newSandbox();
+    // newSandbox() has already adopted via doctor --fix, so the on-disk plist
+    // IS the #1573 pass-file shape. `flair init` must not touch it.
+    const before = readFileSync(sb.plistPath, "utf-8");
+    expect(before).toContain("start-flair-with-admin-pass.sh");
+    expect(before).not.toContain("HDB_ADMIN_PASSWORD");
+
+    const result = await runInit(sb.tmpHome, sb.httpPort);
+
+    const after = readFileSync(sb.plistPath, "utf-8");
+    expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(after, "flair init must not rewrite an adopted plist (#1693)").toBe(before);
+    expect(after).not.toContain("HDB_ADMIN_PASSWORD");
+    expect(result.stdout + result.stderr).toMatch(/unchanged|already managed/i);
+    const managed = assessManaged(sb.dataDir, sb.httpPort, sb.launchAgentsDir);
+    expect(managed.state, managed.detail).toBe("managed");
   },
   TEST_TIMEOUT_MS,
 );
