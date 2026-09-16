@@ -1116,18 +1116,22 @@ export function register(program: Command): void {
     .option("--ops-target <url>", "Explicit ops API URL (env: FLAIR_OPS_TARGET; bypasses port derivation)")
     .action(async (hubUrl: string, opts: any) => {
       const target = resolveTarget(opts);
-      const baseUrl = target ? target.replace(/\/$/, "") : undefined;
+      // One URL for the identity GET and the named error. resolveBaseUrl
+      // honors --target / FLAIR_TARGET / FLAIR_URL / --port — the same host
+      // the GET actually probes (do not cite resolveBaseUrl only in the
+      // rewriter while api() falls through to resolveHttpPort({})).
+      const identityUrl = resolveBaseUrl(opts).replace(/\/$/, "");
       try {
         // flair#820: the identity GET is pair's first step and is allowAdmin.
         // A 403 here is LOCAL (or --target REMOTE), never the hub handshake.
         // Rewrite Harper's raw AccessViolation into a named role/grant error.
         let instance: any;
         try {
-          instance = await api("GET", "/FederationInstance", undefined, baseUrl ? { baseUrl } : undefined);
+          instance = await api("GET", "/FederationInstance", undefined, { baseUrl: identityUrl });
         } catch (err: unknown) {
           throw rewriteFederationPairLocalAccessError(err, {
-            url: (baseUrl ?? resolveBaseUrl(opts)).replace(/\/$/, ""),
-            side: baseUrl ? "REMOTE" : "LOCAL",
+            url: identityUrl,
+            side: target ? "REMOTE" : "LOCAL",
             agentId: process.env.FLAIR_AGENT_ID,
           });
         }

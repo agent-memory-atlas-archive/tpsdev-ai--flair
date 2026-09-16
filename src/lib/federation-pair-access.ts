@@ -11,7 +11,7 @@
  * Named error + operator sentence live here so the contract can be
  * unit-tested without driving process.exit. Pair wraps only the identity
  * GET; later failures (token, hub POST, local Peer write) keep their
- * own messages.
+ * own messages unless the body is specifically a missing pairing role.
  */
 
 export const FEDERATION_INSTANCE_PATH = "/FederationInstance";
@@ -20,7 +20,8 @@ export const FEDERATION_PAIR_HUB_ACCESS_ERROR_NAME = "FederationPairHubAccessErr
 export const PAIR_INITIATOR_ROLE = "flair_pair_initiator";
 export const PAIR_INITIATOR_FIX_COMMAND = "flair init --remote";
 export const ADMIN_AGENTS_ENV = "FLAIR_ADMIN_AGENTS";
-export const PRINCIPAL_PROMOTE_COMMAND = "flair principal promote";
+/** Real admin-grant surface: upserts `role: "admin"` + `admin: true`. */
+export const PRINCIPAL_ADD_ADMIN_COMMAND = "flair principal add";
 
 export type FederationPairAccessSide = "LOCAL" | "REMOTE";
 
@@ -53,23 +54,25 @@ function errorText(err: unknown): string {
   return String(err);
 }
 
-function errorStatus(err: unknown): number | undefined {
-  if (typeof err === "object" && err && "status" in err) {
-    const status = (err as { status?: unknown }).status;
-    return typeof status === "number" ? status : undefined;
+function isNoCredentialsDenial(err: unknown): boolean {
+  if (typeof err === "object" && err && "noCredentials" in err) {
+    return (err as { noCredentials?: unknown }).noCredentials === true;
   }
-  return undefined;
+  return /no credentials sent/i.test(errorText(err));
 }
 
 /**
- * True for the Harper AccessViolation 403 pair's identity GET surfaces
- * today (ApiHttpError.status === 403, or a body/message carrying
- * `error:AccessViolation`). Connect failures stay out.
+ * True only for Harper's AccessViolation body (missing admin on an
+ * authenticated call). Bare 403, no-credentials, and rejected-password
+ * bodies stay out so their honest text is not replaced.
  */
 export function isFederationInstanceAccessViolation(err: unknown): boolean {
-  if (!err) return false;
-  if (errorStatus(err) === 403) return true;
+  if (!err || isNoCredentialsDenial(err)) return false;
   return /AccessViolation/i.test(errorText(err));
+}
+
+export function principalAddAdminInvocation(agentId: string): string {
+  return `${PRINCIPAL_ADD_ADMIN_COMMAND} ${agentId} --admin`;
 }
 
 export function describeFederationPairLocalAccessError(opts: {
@@ -79,16 +82,30 @@ export function describeFederationPairLocalAccessError(opts: {
 }): string {
   const side = opts.side ?? "LOCAL";
   const base = opts.url.replace(/\/$/, "");
-  const agent = opts.agentId && opts.agentId.trim() ? opts.agentId.trim() : "<unknown>";
-  return (
+  const agent = opts.agentId?.trim() ?? "";
+  const identity =
     `pair: cannot read ${side} instance identity ` +
-    `(GET ${base}${FEDERATION_INSTANCE_PATH} → 403 AccessViolation). ` +
+    `(GET ${base}${FEDERATION_INSTANCE_PATH} → 403 AccessViolation). `;
+  const hubRole =
+    `Hub pairing role: if pairing later fails because the hub is missing ` +
+    `${PAIR_INITIATOR_ROLE}, restore it with \`${PAIR_INITIATOR_FIX_COMMAND}\`.`;
+  if (!agent) {
+    return (
+      identity +
+      `Missing role/grant: the calling agent is not a runtime admin ` +
+      `(${FEDERATION_INSTANCE_PATH} is allowAdmin). ` +
+      `Fix: add the agent to ${ADMIN_AGENTS_ENV} in the SERVER process env ` +
+      `(not just .env). Set FLAIR_AGENT_ID so the grant can name the principal. ` +
+      hubRole
+    );
+  }
+  return (
+    identity +
     `Missing role/grant: agent '${agent}' is not a runtime admin ` +
     `(${FEDERATION_INSTANCE_PATH} is allowAdmin). ` +
     `Fix: add '${agent}' to ${ADMIN_AGENTS_ENV} in the SERVER process env ` +
-    `(not just .env), or grant the admin role with \`${PRINCIPAL_PROMOTE_COMMAND} ${agent}\`. ` +
-    `Hub pairing role: if pairing later fails because the hub is missing ` +
-    `${PAIR_INITIATOR_ROLE}, restore it with \`${PAIR_INITIATOR_FIX_COMMAND}\`.`
+    `(not just .env), or grant the admin role with \`${principalAddAdminInvocation(agent)}\`. ` +
+    hubRole
   );
 }
 
@@ -104,14 +121,12 @@ export function rewriteFederationPairLocalAccessError(
 }
 
 /**
- * Hub POST /FederationPair 403 (or a role-not-found body) is a different
- * side and a different missing role: `flair_pair_initiator`, created by
- * `flair init --remote`. Same named-error family so pair never dumps a
- * raw AccessViolation for this path either.
+ * Hub POST /FederationPair is a pairing-role problem only when the body
+ * names `flair_pair_initiator` or a role-not-found. A bare 403 (proxy,
+ * wrong host, rejected bootstrap password) keeps its own text.
  */
-export function isFederationPairHubAccessDenial(status: number, body: string): boolean {
-  if (status === 403) return true;
-  return /AccessViolation|role[- ]?not[- ]?found|flair_pair_initiator/i.test(body);
+export function isFederationPairHubAccessDenial(_status: number, body: string): boolean {
+  return /role[- ]?not[- ]?found|flair_pair_initiator/i.test(body);
 }
 
 export function describeFederationPairHubAccessError(opts: {
