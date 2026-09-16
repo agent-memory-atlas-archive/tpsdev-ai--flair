@@ -19,17 +19,19 @@ import { scanSkillContent } from "./scan/skill-scanner.js";
  * runtime deps) so unit tests can exercise it without instantiating the
  * Harper database.
  *
- * Markdown awareness:
- *  - Inline `single-token` backticks (markdown identifier convention) are NOT
- *    flagged. Only inline backticks whose content actually looks shell-ish
- *    (whitespace, pipe, semicolon, env-var, $(), &&, ||) fire shell_backtick.
- *  - Fenced ```code blocks``` with no language hint or a shell-family
- *    language (sh|bash|shell|zsh) are scanned for shell patterns. Non-shell
- *    language hints (json, yaml, ts, py, graphql, etc.) skip the shell
- *    patterns but keep network/fs/encoding/unicode detection active — those
- *    are language-agnostic attack surfaces.
- *  - This prevents the documentation-as-skill false-positive class without
- *    weakening detection on actual shell content.
+ * Markdown is parsed before scanning (see `./scan/skill-markdown.ts`):
+ *  - Well-formed inline code spans and fenced blocks are documentation
+ *    for `shell_backtick`. Naming `npm create harper@latest` in a bullet
+ *    is not a substitution the loader would execute.
+ *  - Executable surfaces are YAML frontmatter, prose, and fail-closed
+ *    leftovers (unclosed fences, unmatched backtick runs). `$(...)` on
+ *    those surfaces is a substitution. A backtick pair in frontmatter is
+ *    YAML legacy substitution, not markdown docs, and also fires
+ *    `shell_backtick`.
+ *  - Inline and fenced interiors still run the non-backtick detectors
+ *    (exec/network/fs/encoding). Wrapping exec() in one backtick is not
+ *    an exemption. A fence marker is not scanned. Unicode/homoglyph
+ *    checks always run on the raw line.
  */
 
 export class SkillScan extends Resource {

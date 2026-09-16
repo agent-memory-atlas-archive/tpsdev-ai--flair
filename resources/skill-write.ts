@@ -33,7 +33,7 @@
  * memory-visibility.ts).
  */
 
-import { scanSkillContent } from "./scan/skill-scanner.js";
+import { combineScanResults, scanSkillContent } from "./scan/skill-scanner.js";
 import { refuseNonDurableSourceResponse, skillSourceOf } from "./skill-provenance.js";
 
 /** The tag that marks a Memory as a skill. */
@@ -102,10 +102,13 @@ export function rejectSkillWritePath(content: any): Response | null {
 }
 
 /**
- * SkillScan gate — run BEFORE the embedding is computed. Scans the combined
- * `trigger` + `content` text (a dangerous shell/network payload in EITHER is
- * a rejection). Fail-closed on high/critical risk; allow-with-flag on medium
- * (findings appended to `_safetyFlags`); a clean scan is a no-op.
+ * SkillScan gate — run BEFORE the embedding is computed. Scans `trigger`
+ * and `content` separately, then re-assesses the union of findings (a
+ * dangerous payload in EITHER — or split across both — is a rejection).
+ * Joining first lets a crafted trigger plant a `---` pair that steals
+ * frontmatter. Max-of-parts alone drops `shell_backtick` + URL/encoding
+ * across fields to medium. Fail-closed on high/critical; allow-with-flag
+ * on medium.
  *
  * Returns a 400 Response to short-circuit the write, or null to proceed.
  */
@@ -126,7 +129,7 @@ export function skillScanGate(content: any): Response | null {
   );
   if (parts.length === 0) return null;
 
-  const result = scanSkillContent(parts.join("\n\n"));
+  const result = combineScanResults(parts.map((t) => scanSkillContent(t)));
 
   if (result.riskLevel === "high" || result.riskLevel === "critical") {
     return new Response(
