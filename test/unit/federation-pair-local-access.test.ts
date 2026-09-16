@@ -15,12 +15,15 @@ import { describe, test, expect } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { ApiHttpError } from "../../src/lib/auth-resolve.ts";
+import { program } from "../../src/cli.ts";
 import {
+  ADMIN_AGENTS_ENV,
   FEDERATION_INSTANCE_PATH,
   FEDERATION_PAIR_HUB_ACCESS_ERROR_NAME,
   FEDERATION_PAIR_LOCAL_ACCESS_ERROR_NAME,
   PAIR_INITIATOR_FIX_COMMAND,
   PAIR_INITIATOR_ROLE,
+  PRINCIPAL_PROMOTE_COMMAND,
   FederationPairHubAccessError,
   FederationPairLocalAccessError,
   describeFederationPairHubAccessError,
@@ -52,8 +55,8 @@ function assertLocalMessageShape(msg: string): void {
   expect(msg).toContain("403");
   expect(msg).toContain("AccessViolation");
   expect(msg).toMatch(/role\/grant/i);
-  expect(msg).toContain("FLAIR_ADMIN_AGENTS");
-  expect(msg).toContain("flair principal promote");
+  expect(msg).toContain(ADMIN_AGENTS_ENV);
+  expect(msg).toContain(PRINCIPAL_PROMOTE_COMMAND);
   expect(msg).toContain(PAIR_INITIATOR_FIX_COMMAND);
   expect(msg).toContain(PAIR_INITIATOR_ROLE);
   expect(msg).not.toMatch(/^\s*\{\s*"type"\s*:\s*"error:AccessViolation"/);
@@ -138,10 +141,113 @@ describe("hub pairing-role denial — init --remote fix command", () => {
 });
 
 describe("wiring — pair identity GET uses the named rewriter", () => {
-  test("pair action rewrites the local FederationInstance GET, not the hub POST", () => {
+  test("LOCAL rewriter is scoped to the identity GET only (Flint #820)", () => {
     const pairSrc = pairActionSource();
-    expect(pairSrc).toContain("rewriteFederationPairLocalAccessError");
-    expect(pairSrc).toContain("rewriteFederationPairHubAccessError");
-    expect(pairSrc).toContain('api("GET", "/FederationInstance"');
+    const getIdx = pairSrc.indexOf('api("GET", "/FederationInstance"');
+    const localRewriteIdx = pairSrc.indexOf("rewriteFederationPairLocalAccessError");
+    const hubRewriteIdx = pairSrc.indexOf("rewriteFederationPairHubAccessError");
+    const secretKeyIdx = pairSrc.indexOf("loadInstanceSecretKey");
+    const hubPostIdx = pairSrc.indexOf("/FederationPair");
+    expect(getIdx).toBeGreaterThan(-1);
+    expect(localRewriteIdx).toBeGreaterThan(getIdx);
+    expect(localRewriteIdx).toBeLessThan(secretKeyIdx);
+    expect(hubRewriteIdx).toBeGreaterThan(secretKeyIdx);
+    expect(hubPostIdx).toBeGreaterThan(secretKeyIdx);
+    expect(pairSrc.split("rewriteFederationPairLocalAccessError").length - 1).toBe(1);
+  });
+});
+
+/**
+ * PLAN ACCEPTED condition (tps-flint on #1711): every remedy the new
+ * errors name must resolve against the CLI command table or current docs.
+ * A fix hint that names a missing surface is worse than none.
+ */
+function findCommand(root: { commands: readonly { name: () => string }[] }, path: string[]): any {
+  let node: any = root;
+  for (const name of path) {
+    node = node.commands.find((c: any) => c.name() === name);
+    if (!node) return null;
+  }
+  return node;
+}
+
+function backtickSpans(text: string): string[] {
+  return [...text.matchAll(/`([^`]+)`/g)].map((m) => m[1]);
+}
+
+function resolveFlairInvocation(invocation: string): void {
+  expect(invocation.startsWith("flair ")).toBe(true);
+  const tokens = invocation.slice("flair ".length).trim().split(/\s+/);
+  let node: any = program;
+  let i = 0;
+  while (i < tokens.length && !tokens[i].startsWith("-")) {
+    const next = node.commands?.find((c: any) => c.name() === tokens[i]);
+    if (!next) break;
+    node = next;
+    i++;
+  }
+  expect(node).not.toBe(program);
+  expect(node?.name?.()).toBeTruthy();
+  while (i < tokens.length) {
+    const token = tokens[i];
+    if (token.startsWith("--")) {
+      const longs = (node.options ?? []).map((o: any) => o.long);
+      expect(longs, `${invocation} names missing flag ${token} on \`${node.name()}\``).toContain(token);
+    }
+    i++;
+  }
+}
+
+describe("pair-access remedies resolve against CLI / docs (PLAN ACCEPTED #820)", () => {
+  const localMsg = describeFederationPairLocalAccessError({
+    url: IDENTITY_URL,
+    agentId: AGENT_ID,
+  });
+  const hubMsg = describeFederationPairHubAccessError({
+    hubUrl: "https://hub.example:19926",
+    status: 403,
+  });
+  const named = `${localMsg}\n${hubMsg}`;
+
+  test("messages still name the accepted remedies", () => {
+    expect(named).toContain(ADMIN_AGENTS_ENV);
+    expect(named).toContain(PRINCIPAL_PROMOTE_COMMAND);
+    expect(named).toContain(PAIR_INITIATOR_FIX_COMMAND);
+    expect(named).toContain(PAIR_INITIATOR_ROLE);
+  });
+
+  test("every backtick flair invocation exists on the CLI command table", () => {
+    const invocations = backtickSpans(named).filter((span) => span.startsWith("flair "));
+    expect(invocations.length).toBeGreaterThan(0);
+    expect(invocations.some((s) => s.startsWith(PRINCIPAL_PROMOTE_COMMAND))).toBe(true);
+    expect(invocations).toContain(PAIR_INITIATOR_FIX_COMMAND);
+    for (const invocation of invocations) resolveFlairInvocation(invocation);
+  });
+
+  test("FLAIR_ADMIN_AGENTS is a current server-process env surface", () => {
+    const example = readFileSync(join(import.meta.dir, "../../.env.example"), "utf8");
+    const reader = readFileSync(join(import.meta.dir, "../../resources/agent-auth.ts"), "utf8");
+    expect(example).toContain(ADMIN_AGENTS_ENV);
+    expect(example).toMatch(new RegExp(`${ADMIN_AGENTS_ENV}=agent-a,agent-b flair start`));
+    expect(reader).toContain(`process.env.${ADMIN_AGENTS_ENV}`);
+  });
+
+  test("flair principal promote is on the CLI command table", () => {
+    const promote = findCommand(program, ["principal", "promote"]);
+    expect(promote, "missing `flair principal promote`").not.toBeNull();
+    expect(promote.name()).toBe("promote");
+  });
+
+  test("flair init --remote exists and restores flair_pair_initiator", () => {
+    const init = findCommand(program, ["init"]);
+    expect(init, "missing `flair init`").not.toBeNull();
+    const longs = init.options.map((o: any) => o.long);
+    expect(longs).toContain("--remote");
+    const initSrc = readFileSync(join(import.meta.dir, "../../src/commands/init.ts"), "utf8");
+    expect(initSrc).toContain("if (opts.remote)");
+    expect(initSrc).toContain("ensureFlairPairInitiatorRole");
+    const docs = readFileSync(join(import.meta.dir, "../../docs/federation.md"), "utf8");
+    expect(docs).toContain(PAIR_INITIATOR_ROLE);
+    expect(docs).toContain(PAIR_INITIATOR_FIX_COMMAND);
   });
 });

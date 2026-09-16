@@ -19,6 +19,8 @@ export const FEDERATION_PAIR_LOCAL_ACCESS_ERROR_NAME = "FederationPairLocalAcces
 export const FEDERATION_PAIR_HUB_ACCESS_ERROR_NAME = "FederationPairHubAccessError";
 export const PAIR_INITIATOR_ROLE = "flair_pair_initiator";
 export const PAIR_INITIATOR_FIX_COMMAND = "flair init --remote";
+export const ADMIN_AGENTS_ENV = "FLAIR_ADMIN_AGENTS";
+export const PRINCIPAL_PROMOTE_COMMAND = "flair principal promote";
 
 export type FederationPairAccessSide = "LOCAL" | "REMOTE";
 
@@ -83,8 +85,8 @@ export function describeFederationPairLocalAccessError(opts: {
     `(GET ${base}${FEDERATION_INSTANCE_PATH} → 403 AccessViolation). ` +
     `Missing role/grant: agent '${agent}' is not a runtime admin ` +
     `(${FEDERATION_INSTANCE_PATH} is allowAdmin). ` +
-    `Fix: add '${agent}' to FLAIR_ADMIN_AGENTS in the SERVER process env ` +
-    `(not just .env), or grant the admin role with \`flair principal promote ${agent}\`. ` +
+    `Fix: add '${agent}' to ${ADMIN_AGENTS_ENV} in the SERVER process env ` +
+    `(not just .env), or grant the admin role with \`${PRINCIPAL_PROMOTE_COMMAND} ${agent}\`. ` +
     `Hub pairing role: if pairing later fails because the hub is missing ` +
     `${PAIR_INITIATOR_ROLE}, restore it with \`${PAIR_INITIATOR_FIX_COMMAND}\`.`
   );
@@ -133,7 +135,7 @@ export function rewriteFederationPairHubAccessError(
 ): FederationPairHubAccessError | null {
   if (!isFederationPairHubAccessDenial(status, body)) return null;
   return new FederationPairHubAccessError(
-    describeFederationPairHubAccessError({ hubUrl, status, body }),
+    describeFederationPairHubAccessError({ hubUrl, status }),
     status,
   );
 }
