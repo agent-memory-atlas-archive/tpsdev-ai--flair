@@ -1398,34 +1398,28 @@ export function buildDirectSpawnEnv(opts: {
 // at the bottom of this file to preserve the public CLI module surface.
 
 /**
- * Decide the source `flair init` should use for the admin password when no
- * explicit `--admin-pass` / `--admin-pass-file` / env var was given
- * (flair#827).
- *
- * Before this existed, init ALWAYS generated a fresh random password and
- * overwrote `~/.flair/admin-pass` on every run — including a re-run against
- * an install that was already bootstrapped and working (e.g. following
- * `flair doctor`'s ops-bind finding, whose only prescribed remedy is
- * re-running `flair init`). Harper's `HDB_ADMIN_PASSWORD` env var only seeds
- * a brand-new install's user record — it does NOT rotate an existing user's
- * stored password hash on every boot. So overwriting the file desynced it
- * from what Harper actually had persisted, and the very next ops-API call in
- * that SAME init run (seeding the agent) failed with a 401 "Login failed",
- * breaking working auth on an install that had nothing wrong with its
- * credentials.
- *
- * An admin-pass file that already exists on disk IS the working install's
- * password — `flair init` is the only thing that ever writes it — so reuse
- * it instead of generating a new one. That makes re-init idempotent: safe to
- * run again at any time without risking the instance's auth. Deliberately
- * rotating the admin password is a separate operation, not a `flair init`
- * side effect.
+ * Decide the source `flair init` should use for the admin password
+ * (flair#827 + flair#837). Implementation lives in `src/lib/init-admin-pass.ts`
+ * so the persisted-user / rotate / refuse branches stay strictly typed and
+ * unit-tested without expanding this file. Re-exported here so existing
+ * imports of the CLI module surface keep working.
  */
-export function resolveInitAdminPasswordSource(
-  adminPassFileExists: boolean,
-): "reuse-existing" | "generate-new" {
-  return adminPassFileExists ? "reuse-existing" : "generate-new";
-}
+export {
+  resolveInitAdminPasswordSource,
+  detectPersistedAdminUser,
+  initAdminPassRefusalMessage,
+  adminPassDesyncFinding,
+  rotateAdminPasswordViaOpsSocket,
+  callOpsSocket,
+  INIT_RESET_ADMIN_PASS_COMMAND,
+  INIT_ADMIN_PASS_FILE_COMMAND,
+  INIT_STOP_FOREIGN_COMMAND,
+} from "./lib/init-admin-pass.js";
+export type {
+  InitAdminPasswordDecision,
+  InitAdminPasswordContext,
+  InitAdminPasswordRefuseReason,
+} from "./lib/init-admin-pass.js";
 
 // ─── Ops-socket permission posture (flair#763) ─────────────────────────────────
 //
@@ -4045,7 +4039,7 @@ bindInitCli({
   pubKeyPath,
   readyOpsSocketPosture,
   resolveHttpPort,
-  resolveInitAdminPasswordSource,
+  writeAdminPassFile,
   resolveOpsBindHost,
   resolveOpsPort,
   resolveOpsTarget,
