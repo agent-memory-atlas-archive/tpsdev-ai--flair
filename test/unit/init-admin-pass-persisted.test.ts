@@ -10,7 +10,7 @@
  */
 import { describe, test, expect, afterEach } from "bun:test";
 import { createServer } from "node:http";
-import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -25,6 +25,8 @@ import {
   formatAdminPasswordRotatePreflight,
   assertExplicitAdminPasswordRotate,
   isOwnerOnlyOpsSocketPosture,
+  waitForOpsSocketReady,
+  executeAdminPasswordRotate,
   INIT_RESET_ADMIN_PASS_COMMAND,
   INIT_ADMIN_PASS_FILE_COMMAND,
   INIT_STOP_FOREIGN_COMMAND,
@@ -172,6 +174,16 @@ describe("refusal names the exact recovery command", () => {
     expect(msg).toContain("0700");
     expect(msg).toContain("0600");
     expect(msg).toContain("super_user");
+    expect(msg).toContain(INIT_RESET_ADMIN_PASS_COMMAND);
+  });
+
+  test("socket-not-ready names the socket and refuses before write", () => {
+    const msg = initAdminPassRefusalMessage("socket-not-ready", {
+      socketPath: "/data/operations-server",
+    });
+    expect(msg).toContain("/data/operations-server");
+    expect(msg).toContain("never became ready");
+    expect(msg).toContain("Refusing before any alter_user");
     expect(msg).toContain(INIT_RESET_ADMIN_PASS_COMMAND);
   });
 });
@@ -405,5 +417,155 @@ describe("PLAN ACCEPTED conditions — preflight, owner-only, fails-first 401", 
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+  });
+});
+
+describe("executeAdminPasswordRotate — socket ready, not HTTP health", () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const d of dirs.splice(0)) {
+      try { rmSync(d, { recursive: true, force: true }); } catch { /* */ }
+    }
+  });
+
+  test("waitForOpsSocketReady treats a dead leftover inode as not-ready", async () => {
+    const dir = makeTmpDir();
+    dirs.push(dir);
+    const socketPath = join(dir, "operations-server");
+    writeFileSync(socketPath, "");
+    let polls = 0;
+    const ready = await waitForOpsSocketReady(socketPath, {
+      timeoutMs: 60,
+      pollMs: 15,
+      isLive: async () => {
+        polls += 1;
+        return false;
+      },
+    });
+    expect(ready).toBe(false);
+    expect(polls).toBeGreaterThan(0);
+  });
+
+  test("waitForOpsSocketReady becomes ready once the socket accepts", async () => {
+    let polls = 0;
+    const ready = await waitForOpsSocketReady("/data/operations-server", {
+      timeoutMs: 200,
+      pollMs: 10,
+      isLive: async () => {
+        polls += 1;
+        return polls >= 3;
+      },
+    });
+    expect(ready).toBe(true);
+    expect(polls).toBe(3);
+  });
+
+  test("FAILS-FIRST: HTTP healthy + dead leftover socket refuses, writes no pass file, leaves the hash untouched", async () => {
+    // Without the wait, prepare sees a 0600 leftover inode and calls alter_user
+    // immediately. That is the Bugbot race: HTTP /Health already succeeded.
+    const dir = makeTmpDir();
+    dirs.push(dir);
+    mkdirSync(join(dir, "system", "hdb_user"), { recursive: true });
+    chmodSync(dir, 0o700);
+    const hashPath = join(dir, "system", "hdb_user", "data.mdb");
+    writeFileSync(hashPath, "existing-hash-untouched");
+    const socketPath = join(dir, "operations-server");
+    writeFileSync(socketPath, "");
+    chmodSync(socketPath, 0o600);
+    const passPath = join(dir, "admin-pass");
+    const writes: string[] = [];
+    const rotates: unknown[] = [];
+    const preflights: string[] = [];
+
+    await expect(executeAdminPasswordRotate({
+      resetRequested: true,
+      username: "admin",
+      password: "new-secret-must-not-land",
+      socketPath,
+      adminPassPath: passPath,
+      writeAdminPassFile: (p, contents) => {
+        writes.push(p);
+        writeFileSync(p, contents);
+      },
+      rotate: async (...args) => {
+        rotates.push(args);
+      },
+      isLive: async () => false,
+      timeoutMs: 80,
+      pollMs: 20,
+      stat: (p) => p === socketPath ? { mode: 0o600 } : { mode: 0o700 },
+      onPreflight: (line) => preflights.push(line),
+    })).rejects.toThrow(/never became ready/);
+
+    expect(writes).toHaveLength(0);
+    expect(rotates).toHaveLength(0);
+    expect(preflights).toHaveLength(0);
+    expect(existsSync(passPath)).toBe(false);
+    expect(readFileSync(hashPath, "utf8")).toBe("existing-hash-untouched");
+  });
+
+  test("FAILS-FIRST: HTTP healthy + absent socket refuses before alter_user or write", async () => {
+    const dir = makeTmpDir();
+    dirs.push(dir);
+    mkdirSync(join(dir, "system", "hdb_user"), { recursive: true });
+    const hashPath = join(dir, "system", "hdb_user", "data.mdb");
+    writeFileSync(hashPath, "existing-hash-untouched");
+    const socketPath = join(dir, "operations-server");
+    const passPath = join(dir, "admin-pass");
+    const writes: string[] = [];
+    const rotates: unknown[] = [];
+
+    await expect(executeAdminPasswordRotate({
+      resetRequested: true,
+      username: "admin",
+      password: "new-secret-must-not-land",
+      socketPath,
+      adminPassPath: passPath,
+      writeAdminPassFile: (p, contents) => {
+        writes.push(p);
+        writeFileSync(p, contents);
+      },
+      rotate: async (...args) => {
+        rotates.push(args);
+      },
+      isLive: async () => false,
+      timeoutMs: 60,
+      pollMs: 15,
+    })).rejects.toThrow(/never became ready/);
+
+    expect(writes).toHaveLength(0);
+    expect(rotates).toHaveLength(0);
+    expect(existsSync(passPath)).toBe(false);
+    expect(readFileSync(hashPath, "utf8")).toBe("existing-hash-untouched");
+  });
+
+  test("live socket: alter_user then write, never write first", async () => {
+    const dir = makeTmpDir();
+    dirs.push(dir);
+    const socketPath = join(dir, "operations-server");
+    const passPath = join(dir, "admin-pass");
+    const order: string[] = [];
+
+    await executeAdminPasswordRotate({
+      resetRequested: true,
+      username: "admin",
+      password: "rotated-secret",
+      socketPath,
+      adminPassPath: passPath,
+      writeAdminPassFile: (p, contents) => {
+        order.push("write");
+        writeFileSync(p, contents);
+      },
+      rotate: async () => {
+        order.push("alter_user");
+      },
+      isLive: async () => true,
+      timeoutMs: 50,
+      pollMs: 10,
+      stat: (p) => p === socketPath ? { mode: 0o600 } : { mode: 0o700 },
+    });
+
+    expect(order).toEqual(["alter_user", "write"]);
+    expect(readFileSync(passPath, "utf8")).toBe("rotated-secret\n");
   });
 });

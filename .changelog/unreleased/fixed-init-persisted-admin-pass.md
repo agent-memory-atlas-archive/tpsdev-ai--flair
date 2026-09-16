@@ -3,7 +3,7 @@
   When `~/.flair/admin-pass` is missing but the data dir already has an
   admin user, bare `init` refuses and names the two exits: pass the original
   with `--admin-pass-file <path>`, or rotate on purpose with
-  `flair init --reset-admin-pass` (ops-socket `alter_user`, then write the
+  `flair init --reset-admin-pass` (the operations socket `alter_user`, then write the
   file). A leftover Harper answering on the port against a fresh data dir
   is refused with `flair stop`. `flair doctor` reports the missing-file
   desync the same way.

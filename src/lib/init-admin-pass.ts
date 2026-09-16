@@ -25,6 +25,7 @@
  * thin `node:http` client against `dataDir/operations-server`.
  */
 import { request as httpRequest } from "node:http";
+import { createConnection } from "node:net";
 import { existsSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 
@@ -44,7 +45,8 @@ export type InitAdminPasswordRefuseReason =
   | "persisted-missing-file"
   | "foreign-instance"
   | "reset-without-socket"
-  | "socket-not-owner-only";
+  | "socket-not-owner-only"
+  | "socket-not-ready";
 
 /** Short doctor remedy — names the two exits as the fix (report-only). */
 export const ADMIN_PASS_DESYNC_REMEDY =
@@ -170,6 +172,15 @@ export function initAdminPassRefusalMessage(
       `(required: parent dir 0700 / socket 0600, flair#1704). The socket is a super_user channel ` +
       `with no Authorization header, so a group/world-accessible socket would expose credential rotation. ` +
       `Fix the posture, then run:\n  ${INIT_RESET_ADMIN_PASS_COMMAND}`
+    );
+  }
+  if (reason === "socket-not-ready") {
+    const socket = opts.socketPath ?? "<data-dir>/operations-server";
+    return (
+      `Cannot rotate the admin password: the operations socket at ${socket} never became ready ` +
+      `to accept a connection. Harper can answer HTTP health before it binds that socket, and a ` +
+      `leftover inode that does not accept connections is not ready. Refusing before any alter_user ` +
+      `or pass-file write. Wait until the instance has bound the socket, then run:\n  ${INIT_RESET_ADMIN_PASS_COMMAND}`
     );
   }
   const dataDir = opts.dataDir ?? "<data-dir>";
@@ -339,4 +350,121 @@ export async function rotateAdminPasswordViaOpsSocket(
       `Operations socket alter_user failed (${result.status}): ${result.body || "(empty)"}`,
     );
   }
+}
+
+/** How long rotate waits for Harper to bind and accept on operations-server. */
+export const OPS_SOCKET_ROTATE_TIMEOUT_MS = 10_000;
+const OPS_SOCKET_ROTATE_POLL_MS = 50;
+const OPS_SOCKET_ROTATE_PROBE_TIMEOUT_MS = 250;
+
+/**
+ * True when something is accepting on `path`. A leftover inode that exists
+ * but accepts no connection is dead — not ready. HTTP /Health is not a
+ * substitute: Harper can answer HTTP before it bind()s this socket.
+ */
+export function probeOpsSocketAccepting(
+  socketPath: string,
+  timeoutMs = OPS_SOCKET_ROTATE_PROBE_TIMEOUT_MS,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      sock.removeAllListeners();
+      sock.destroy();
+      resolve(ok);
+    };
+    const sock = createConnection(socketPath);
+    sock.setTimeout(timeoutMs);
+    sock.once("connect", () => finish(true));
+    sock.once("error", () => finish(false));
+    sock.once("timeout", () => finish(false));
+  });
+}
+
+export interface WaitForOpsSocketReadyOptions {
+  timeoutMs?: number;
+  pollMs?: number;
+  /** True only when a process is accepting — dead leftover inode → false. */
+  isLive?: (path: string) => boolean | Promise<boolean>;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * Bounded wait until the operations socket accepts a connection.
+ * A missing path or a stale/dead inode is not-ready; this never unlinks
+ * and never falls through to the HTTP ops path.
+ */
+export async function waitForOpsSocketReady(
+  socketPath: string,
+  opts: WaitForOpsSocketReadyOptions = {},
+): Promise<boolean> {
+  const timeoutMs = opts.timeoutMs ?? OPS_SOCKET_ROTATE_TIMEOUT_MS;
+  const pollMs = opts.pollMs ?? OPS_SOCKET_ROTATE_POLL_MS;
+  const isLive = opts.isLive ?? ((p: string) => probeOpsSocketAccepting(p));
+  const now = opts.now ?? Date.now;
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const deadline = now() + timeoutMs;
+  while (now() < deadline) {
+    if (await isLive(socketPath)) return true;
+    const remaining = deadline - now();
+    if (remaining <= 0) break;
+    await sleep(Math.min(pollMs, remaining));
+  }
+  return false;
+}
+
+export interface ExecuteAdminPasswordRotateOptions {
+  resetRequested: boolean;
+  username: string;
+  password: string;
+  socketPath: string;
+  adminPassPath: string;
+  writeAdminPassFile: (path: string, contents: string) => void;
+  timeoutMs?: number;
+  pollMs?: number;
+  isLive?: (path: string) => boolean | Promise<boolean>;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+  stat?: (path: string) => OpsSocketStat;
+  rotate?: (socketPath: string, username: string, password: string) => Promise<void>;
+  onPreflight?: (line: string) => void;
+}
+
+/**
+ * Rotate entry used by `flair init --reset-admin-pass`.
+ *
+ * Readiness is the operations socket accepting a connection, not HTTP
+ * health. Wait (bounded, real timeout) first. A dead leftover inode is
+ * not-ready. If the socket never becomes ready, refuse before any
+ * alter_user and before any pass-file write — never fall through to HTTP.
+ * On success: owner-only check, preflight, alter_user, then write.
+ */
+export async function executeAdminPasswordRotate(
+  opts: ExecuteAdminPasswordRotateOptions,
+): Promise<void> {
+  assertExplicitAdminPasswordRotate(opts.resetRequested);
+  const ready = await waitForOpsSocketReady(opts.socketPath, {
+    timeoutMs: opts.timeoutMs,
+    pollMs: opts.pollMs,
+    isLive: opts.isLive,
+    now: opts.now,
+    sleep: opts.sleep,
+  });
+  if (!ready) {
+    throw new Error(initAdminPassRefusalMessage("socket-not-ready", { socketPath: opts.socketPath }));
+  }
+  const preflight = prepareAdminPasswordRotate({
+    resetRequested: opts.resetRequested,
+    username: opts.username,
+    socketPath: opts.socketPath,
+    adminPassPath: opts.adminPassPath,
+    stat: opts.stat,
+  });
+  opts.onPreflight?.(preflight);
+  const rotate = opts.rotate ?? rotateAdminPasswordViaOpsSocket;
+  await rotate(opts.socketPath, opts.username, opts.password);
+  opts.writeAdminPassFile(opts.adminPassPath, opts.password + "\n");
 }

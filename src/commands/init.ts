@@ -13,11 +13,10 @@ import { ClientId, detectClients, renderWiringSummary, wireAntigravity, wireCode
 import { DEFAULT_ADMIN_USER, authFetch, defaultAdminPassPath, defaultKeysDir, readAdminPassFileSecure, resolveAdminUser } from "../lib/auth-resolve.js";
 import {
   detectPersistedAdminUser,
+  executeAdminPasswordRotate,
   initAdminPassRefusalMessage,
-  prepareAdminPasswordRotate,
   resolveInitAdminPasswordRefuseReason,
   resolveInitAdminPasswordSource,
-  rotateAdminPasswordViaOpsSocket,
 } from "../lib/init-admin-pass.js";
 import { mcpServerSpec, unpinnedSpecWarning } from "../lib/mcp-spec.js";
 import * as render from "../render.js";
@@ -773,16 +772,24 @@ program
       readyOpsSocketPosture(dataDir);
 
       if (pendingAdminPassRotate) {
+        // HTTP /Health is not rotate-ready: Harper can answer it before
+        // operations-server accepts. Wait for a live socket, then alter_user,
+        // then write. A dead leftover inode is not-ready — refuse, no write.
         const opsSocket = join(dataDir, "operations-server");
-        const preflight = prepareAdminPasswordRotate({
-          resetRequested: !!opts.resetAdminPass,
-          username: adminUser,
-          socketPath: opsSocket,
-          adminPassPath,
-        });
-        console.log(preflight);
-        await rotateAdminPasswordViaOpsSocket(opsSocket, adminUser, adminPass);
-        writeAdminPassFile(adminPassPath, adminPass + "\n");
+        try {
+          await executeAdminPasswordRotate({
+            resetRequested: !!opts.resetAdminPass,
+            username: adminUser,
+            password: adminPass,
+            socketPath: opsSocket,
+            adminPassPath,
+            writeAdminPassFile,
+            onPreflight: (line) => console.log(line),
+          });
+        } catch (err: any) {
+          console.error(err?.message ?? err);
+          process.exit(1);
+        }
         pendingAdminPassRotate = false;
         console.log(`Admin password saved to: ${adminPassPath}`);
       }
@@ -866,16 +873,24 @@ program
     }
 
     if (pendingAdminPassRotate) {
+      // Same gate as the post-health path: readiness is the operations
+      // socket accepting a connection, not HTTP. Never fall through to
+      // the HTTP ops path; never write the pass file if rotate did not land.
       const opsSocket = join(dataDir, "operations-server");
-      const preflight = prepareAdminPasswordRotate({
-        resetRequested: !!opts.resetAdminPass,
-        username: adminUser,
-        socketPath: opsSocket,
-        adminPassPath,
-      });
-      console.log(preflight);
-      await rotateAdminPasswordViaOpsSocket(opsSocket, adminUser, adminPass);
-      writeAdminPassFile(adminPassPath, adminPass + "\n");
+      try {
+        await executeAdminPasswordRotate({
+          resetRequested: !!opts.resetAdminPass,
+          username: adminUser,
+          password: adminPass,
+          socketPath: opsSocket,
+          adminPassPath,
+          writeAdminPassFile,
+          onPreflight: (line) => console.log(line),
+        });
+      } catch (err: any) {
+        console.error(err?.message ?? err);
+        process.exit(1);
+      }
       pendingAdminPassRotate = false;
       console.log(`Admin password saved to: ${adminPassPath}`);
     }
