@@ -199,6 +199,12 @@ import {
   isFederationStatusAuthRemedy,
 } from "./commands/federation.js";
 import {
+  describeFederationPairHubAccessError,
+  describeFederationPairLocalAccessError,
+  rewriteFederationPairHubAccessError,
+  rewriteFederationPairLocalAccessError,
+} from "./lib/federation-pair-access.js";
+import {
   bindCli as bindMemoryCli,
   register as registerMemory,
   categorizeForHygiene,
@@ -6306,6 +6312,13 @@ export {
   rewriteFederationStatusFetchFailed,
   isFederationStatusAuthFailure,
   isFederationStatusAuthRemedy,
+};
+
+export {
+  describeFederationPairHubAccessError,
+  describeFederationPairLocalAccessError,
+  rewriteFederationPairHubAccessError,
+  rewriteFederationPairLocalAccessError,
 };
 
 export {
