@@ -10,7 +10,7 @@
  */
 import { describe, test, expect, afterEach } from "bun:test";
 import { createServer } from "node:http";
-import { mkdirSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -21,9 +21,14 @@ import {
   adminPassDesyncFinding,
   callOpsSocket,
   rotateAdminPasswordViaOpsSocket,
+  prepareAdminPasswordRotate,
+  formatAdminPasswordRotatePreflight,
+  assertExplicitAdminPasswordRotate,
+  isOwnerOnlyOpsSocketPosture,
   INIT_RESET_ADMIN_PASS_COMMAND,
   INIT_ADMIN_PASS_FILE_COMMAND,
   INIT_STOP_FOREIGN_COMMAND,
+  ADMIN_PASS_DESYNC_REMEDY,
 } from "../../src/lib/init-admin-pass.ts";
 
 function makeTmpDir(): string {
@@ -45,6 +50,13 @@ describe("resolveInitAdminPasswordSource — flair#837 persisted user", () => {
   test("bare init against a persisted user refuses (does not guess)", () => {
     expect(resolveInitAdminPasswordSource(false, { persistedAdminUser: true })).toBe("refuse");
     expect(resolveInitAdminPasswordRefuseReason(false, { persistedAdminUser: true })).toBe("persisted-missing-file");
+  });
+
+  test("socket available without --reset-admin-pass is still refuse, never rotate", () => {
+    expect(resolveInitAdminPasswordSource(false, {
+      persistedAdminUser: true,
+      opsSocketAvailable: true,
+    })).toBe("refuse");
   });
 
   test("explicit credential + persisted user re-persists the file", () => {
@@ -151,6 +163,17 @@ describe("refusal names the exact recovery command", () => {
     const msg = initAdminPassRefusalMessage("reset-without-socket");
     expect(msg).toContain(INIT_RESET_ADMIN_PASS_COMMAND);
   });
+
+  test("socket-not-owner-only names the posture and the reset command", () => {
+    const msg = initAdminPassRefusalMessage("socket-not-owner-only", {
+      socketPath: "/data/operations-server",
+    });
+    expect(msg).toContain("/data/operations-server");
+    expect(msg).toContain("0700");
+    expect(msg).toContain("0600");
+    expect(msg).toContain("super_user");
+    expect(msg).toContain(INIT_RESET_ADMIN_PASS_COMMAND);
+  });
 });
 
 describe("adminPassDesyncFinding — doctor report-only", () => {
@@ -162,6 +185,8 @@ describe("adminPassDesyncFinding — doctor report-only", () => {
       adminPassPath: "/pass",
     });
     expect(finding?.flagged).toBe(true);
+    expect(finding?.remedy).toBe(ADMIN_PASS_DESYNC_REMEDY);
+    expect(finding?.remedy).toContain("Fix:");
     expect(finding?.remedy).toContain(INIT_RESET_ADMIN_PASS_COMMAND);
     expect(finding?.remedy).toContain(INIT_ADMIN_PASS_FILE_COMMAND);
   });
@@ -253,6 +278,130 @@ describe("rotateAdminPasswordViaOpsSocket — no Authorization header", () => {
     try {
       const result = await callOpsSocket(socketPath, { operation: "list_users" });
       expect(result.status).toBe(200);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
+
+describe("PLAN ACCEPTED conditions — preflight, owner-only, fails-first 401", () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const d of dirs.splice(0)) {
+      try { rmSync(d, { recursive: true, force: true }); } catch { /* */ }
+    }
+  });
+
+  test("preflight names the user, socket, and destination file before alter_user", () => {
+    const msg = formatAdminPasswordRotatePreflight({
+      username: "admin",
+      socketPath: "/data/operations-server",
+      adminPassPath: "/home/op/.flair/admin-pass",
+    });
+    expect(msg).toContain("admin");
+    expect(msg).toContain("/data/operations-server");
+    expect(msg).toContain("/home/op/.flair/admin-pass");
+    expect(msg).toContain("super_user");
+    expect(msg).toContain("no Authorization header");
+    expect(msg).toContain("0700");
+    expect(msg).toContain("0600");
+  });
+
+  test("rotate is unreachable without --reset-admin-pass", () => {
+    expect(() => assertExplicitAdminPasswordRotate(false)).toThrow(/--reset-admin-pass was not given/);
+    expect(() => assertExplicitAdminPasswordRotate(true)).not.toThrow();
+    expect(() => prepareAdminPasswordRotate({
+      resetRequested: false,
+      username: "admin",
+      socketPath: "/nope",
+      adminPassPath: "/pass",
+      stat: () => ({ mode: 0o600 }),
+    })).toThrow(/--reset-admin-pass was not given/);
+  });
+
+  test("owner-only posture is exactly 0700 dir / 0600 socket", () => {
+    expect(isOwnerOnlyOpsSocketPosture(0o700, 0o600)).toBe(true);
+    expect(isOwnerOnlyOpsSocketPosture(0o750, 0o600)).toBe(false);
+    expect(isOwnerOnlyOpsSocketPosture(0o700, 0o660)).toBe(false);
+    expect(isOwnerOnlyOpsSocketPosture(0o755, 0o755)).toBe(false);
+  });
+
+  test("prepare refuses a group/world-accessible socket", () => {
+    expect(() => prepareAdminPasswordRotate({
+      resetRequested: true,
+      username: "admin",
+      socketPath: "/data/operations-server",
+      adminPassPath: "/pass",
+      stat: (p) => p.endsWith("operations-server") ? { mode: 0o755 } : { mode: 0o755 },
+    })).toThrow(/not owner-only/);
+    expect(() => prepareAdminPasswordRotate({
+      resetRequested: true,
+      username: "admin",
+      socketPath: "/data/operations-server",
+      adminPassPath: "/pass",
+      stat: (p) => p.endsWith("operations-server") ? { mode: 0o600 } : { mode: 0o700 },
+    })).not.toThrow();
+  });
+
+  test("FAILS-FIRST: missing file + persisted user + bare init on main writes a desynced file and the next ops call 401s; branch refuses and writes nothing", async () => {
+    const dir = makeTmpDir();
+    dirs.push(dir);
+    mkdirSync(join(dir, "system", "hdb_user"), { recursive: true });
+    writeFileSync(join(dir, "system", "hdb_user", "data.mdb"), "user-hash");
+    const passPath = join(dir, "admin-pass");
+    expect(detectPersistedAdminUser(dir)).toBe(true);
+    expect(existsSync(passPath)).toBe(false);
+
+    const original = "original-persisted-password";
+    const server = createServer((req, res) => {
+      const expected = "Basic " + Buffer.from(`admin:${original}`).toString("base64");
+      if (req.headers.authorization !== expected) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Login failed" }));
+        return;
+      }
+      res.writeHead(200);
+      res.end("{}");
+    });
+    const port = await new Promise<number>((resolve, reject) => {
+      server.listen(0, "127.0.0.1", () => {
+        const addr = server.address();
+        if (addr && typeof addr === "object") resolve(addr.port);
+        else reject(new Error("no port"));
+      });
+      server.on("error", reject);
+    });
+
+    try {
+      // BEFORE (main): 1-arg form is generate-new. Writing that file desyncs
+      // from the stored hash; the next ops call 401s.
+      const mainDecision = resolveInitAdminPasswordSource(false);
+      expect(mainDecision).toBe("generate-new");
+      const desynced = "freshly-generated-does-not-match-hash";
+      writeFileSync(passPath, desynced + "\n", { mode: 0o600 });
+      chmodSync(passPath, 0o600);
+      const before = await fetch(`http://127.0.0.1:${port}/`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Basic " + Buffer.from(`admin:${desynced}`).toString("base64"),
+        },
+        body: JSON.stringify({ operation: "insert" }),
+      });
+      expect(before.status).toBe(401);
+      expect((await before.json() as { error: string }).error).toBe("Login failed");
+
+      rmSync(passPath);
+
+      // AFTER (branch): 2-arg form with persisted user refuses. No file.
+      const branchDecision = resolveInitAdminPasswordSource(false, { persistedAdminUser: true });
+      expect(branchDecision).toBe("refuse");
+      expect(existsSync(passPath)).toBe(false);
+      const reason = resolveInitAdminPasswordRefuseReason(false, { persistedAdminUser: true });
+      expect(reason).toBe("persisted-missing-file");
+      const refusal = initAdminPassRefusalMessage(reason!, { dataDir: dir, adminPassPath: passPath });
+      expect(refusal).toContain(INIT_RESET_ADMIN_PASS_COMMAND);
+      expect(refusal).toContain(INIT_ADMIN_PASS_FILE_COMMAND);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }

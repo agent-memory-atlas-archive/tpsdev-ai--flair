@@ -1410,10 +1410,16 @@ export {
   initAdminPassRefusalMessage,
   adminPassDesyncFinding,
   rotateAdminPasswordViaOpsSocket,
+  prepareAdminPasswordRotate,
+  formatAdminPasswordRotatePreflight,
+  assertExplicitAdminPasswordRotate,
+  assertOwnerOnlyOpsSocket,
+  isOwnerOnlyOpsSocketPosture,
   callOpsSocket,
   INIT_RESET_ADMIN_PASS_COMMAND,
   INIT_ADMIN_PASS_FILE_COMMAND,
   INIT_STOP_FOREIGN_COMMAND,
+  ADMIN_PASS_DESYNC_REMEDY,
 } from "./lib/init-admin-pass.js";
 export type {
   InitAdminPasswordDecision,

@@ -557,9 +557,10 @@ program
       }
     } catch { /* best-effort — don't fail doctor over a malformed harper-config.yaml */ }
 
-    // 3b2. Admin-pass vs persisted Harper user (flair#837) — report-only.
-    // File missing + hdb_user still in the data dir is the state bare `init`
-    // used to "fix" by writing a fresh file that 401s. Name the two exits.
+    // 3b2. Admin-pass vs persisted Harper user (flair#837) — report-only,
+    // never `--fix`. File missing + hdb_user still in the data dir is the
+    // state bare `init` used to "fix" by writing a fresh file that 401s.
+    // The remedy names the two exits: `--admin-pass-file` / `--reset-admin-pass`.
     try {
       const dataDir = defaultDataDir();
       const finding = adminPassDesyncFinding({

@@ -10,16 +10,23 @@
  *
  * This module is the single decision + the two exits that can actually be
  * right: re-persist a supplied original credential, or rotate the stored
- * hash through the ops-API domain socket (`alter_user`, no Authorization —
- * Harper's `bypassLocalAuth` on the socket is an else-if on "no header").
+ * hash through the ops-API domain socket (`alter_user`, no Authorization).
  * Silent regeneration is never a decision here.
+ *
+ * Security property the rotate path relies on (flair#837 condition 2,
+ * #1704): the ops domain socket is a Harper `super_user` channel with no
+ * Authorization header (`bypassLocalAuth` is an else-if on "no header
+ * present"). That is safe ONLY because of the socket posture — parent dir
+ * 0700, socket 0600. The rotate path refuses if the socket is not
+ * owner-only. `--reset-admin-pass` is the only path that may rotate; it
+ * prints the user, socket, and destination file before doing it.
  *
  * Pure decision helpers are exported for unit tests. The socket POST is a
  * thin `node:http` client against `dataDir/operations-server`.
  */
 import { request as httpRequest } from "node:http";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, statSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 /** Copy-pasteable recovery commands. Tests assert these strings verbatim. */
 export const INIT_RESET_ADMIN_PASS_COMMAND = "flair init --reset-admin-pass";
@@ -36,7 +43,12 @@ export type InitAdminPasswordDecision =
 export type InitAdminPasswordRefuseReason =
   | "persisted-missing-file"
   | "foreign-instance"
-  | "reset-without-socket";
+  | "reset-without-socket"
+  | "socket-not-owner-only";
+
+/** Short doctor remedy — names the two exits as the fix (report-only). */
+export const ADMIN_PASS_DESYNC_REMEDY =
+  `Fix: ${INIT_ADMIN_PASS_FILE_COMMAND} (if you have the original) or ${INIT_RESET_ADMIN_PASS_COMMAND}`;
 
 export interface InitAdminPasswordContext {
   /** Harper already has a user record in THIS data dir (hdb_user mdb). */
@@ -92,6 +104,8 @@ export function resolveInitAdminPasswordSource(
     return "re-persist";
   }
 
+  // Rotate is production credential rotation. The ONLY way in is the
+  // explicit `--reset-admin-pass` flag — never a missing-file guess.
   if (reset) {
     return socketOk ? "rotate" : "refuse";
   }
@@ -134,7 +148,7 @@ export function detectPersistedAdminUser(dataDir: string): boolean {
 
 export function initAdminPassRefusalMessage(
   reason: InitAdminPasswordRefuseReason,
-  opts: { dataDir?: string; httpPort?: number; adminPassPath?: string } = {},
+  opts: { dataDir?: string; httpPort?: number; adminPassPath?: string; socketPath?: string } = {},
 ): string {
   if (reason === "foreign-instance") {
     const port = opts.httpPort ?? 19926;
@@ -147,6 +161,15 @@ export function initAdminPassRefusalMessage(
     return (
       `Cannot rotate the admin password: Harper is not running and --skip-start was set, so the operations socket is unreachable. ` +
       `Start the instance, then run:\n  ${INIT_RESET_ADMIN_PASS_COMMAND}`
+    );
+  }
+  if (reason === "socket-not-owner-only") {
+    const socket = opts.socketPath ?? "<data-dir>/operations-server";
+    return (
+      `Refusing to rotate the admin password: the operations socket at ${socket} is not owner-only ` +
+      `(required: parent dir 0700 / socket 0600, flair#1704). The socket is a super_user channel ` +
+      `with no Authorization header, so a group/world-accessible socket would expose credential rotation. ` +
+      `Fix the posture, then run:\n  ${INIT_RESET_ADMIN_PASS_COMMAND}`
     );
   }
   const dataDir = opts.dataDir ?? "<data-dir>";
@@ -175,11 +198,58 @@ export function adminPassDesyncFinding(input: {
   return {
     flagged: true,
     message: "admin-pass file missing; Harper still has a persisted admin user",
-    remedy: initAdminPassRefusalMessage("persisted-missing-file", {
-      dataDir: input.dataDir,
-      adminPassPath: input.adminPassPath,
-    }),
+    remedy: ADMIN_PASS_DESYNC_REMEDY,
   };
+}
+
+/**
+ * `--reset-admin-pass` is production credential rotation. Print this
+ * exactly — user, socket, destination file — before any alter_user.
+ */
+export function formatAdminPasswordRotatePreflight(opts: {
+  username: string;
+  socketPath: string;
+  adminPassPath: string;
+}): string {
+  return (
+    `About to rotate Harper admin user '${opts.username}' via operations socket ${opts.socketPath} ` +
+    `(super_user channel, no Authorization header; safe only because the socket is owner-only: ` +
+    `0700 dir / 0600 socket, flair#1704). After alter_user succeeds the new password will be written to ${opts.adminPassPath}.`
+  );
+}
+
+/** Rotate is reachable only from `--reset-admin-pass`. */
+export function assertExplicitAdminPasswordRotate(resetRequested: boolean): void {
+  if (!resetRequested) {
+    throw new Error(
+      "Refusing to rotate the admin password: --reset-admin-pass was not given. " +
+      "Bare init never rotates a persisted hash.",
+    );
+  }
+}
+
+/** Owner-only ops-socket posture (flair#1704): dir 0700, socket 0600. */
+export function isOwnerOnlyOpsSocketPosture(dirMode: number, socketMode: number): boolean {
+  return (dirMode & 0o777) === 0o700 && (socketMode & 0o777) === 0o600;
+}
+
+export interface OpsSocketStat {
+  mode: number;
+}
+
+/**
+ * Refuse rotation unless the socket and its parent directory are owner-only.
+ * The socket is a super_user channel with no Authorization header.
+ */
+export function assertOwnerOnlyOpsSocket(
+  socketPath: string,
+  stat: (path: string) => OpsSocketStat = (p) => statSync(p),
+): void {
+  const socket = stat(socketPath);
+  const dir = stat(dirname(socketPath));
+  if (!isOwnerOnlyOpsSocketPosture(dir.mode, socket.mode)) {
+    throw new Error(initAdminPassRefusalMessage("socket-not-owner-only", { socketPath }));
+  }
 }
 
 export interface OpsSocketCallResult {
@@ -229,6 +299,26 @@ export function callOpsSocket(
     });
     req.write(payload);
     req.end();
+  });
+}
+
+/**
+ * Gate the rotate path: explicit `--reset-admin-pass` AND owner-only socket.
+ * Returns the preflight line the caller MUST print before `alter_user`.
+ */
+export function prepareAdminPasswordRotate(opts: {
+  resetRequested: boolean;
+  username: string;
+  socketPath: string;
+  adminPassPath: string;
+  stat?: (path: string) => OpsSocketStat;
+}): string {
+  assertExplicitAdminPasswordRotate(opts.resetRequested);
+  assertOwnerOnlyOpsSocket(opts.socketPath, opts.stat);
+  return formatAdminPasswordRotatePreflight({
+    username: opts.username,
+    socketPath: opts.socketPath,
+    adminPassPath: opts.adminPassPath,
   });
 }
 

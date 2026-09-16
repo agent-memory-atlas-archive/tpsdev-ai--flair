@@ -14,6 +14,7 @@ import { DEFAULT_ADMIN_USER, authFetch, defaultAdminPassPath, defaultKeysDir, re
 import {
   detectPersistedAdminUser,
   initAdminPassRefusalMessage,
+  prepareAdminPasswordRotate,
   resolveInitAdminPasswordRefuseReason,
   resolveInitAdminPasswordSource,
   rotateAdminPasswordViaOpsSocket,
@@ -592,6 +593,9 @@ program
         adminPass = Buffer.from(nacl.randomBytes(18)).toString("base64url");
         writeAdminPassFile(adminPassPath, adminPass + "\n");
       } else if (decision === "rotate") {
+        if (!opts.resetAdminPass) {
+          throw new Error("unreachable: rotate without --reset-admin-pass");
+        }
         adminPass = Buffer.from(nacl.randomBytes(18)).toString("base64url");
         pendingAdminPassRotate = true;
       } else {
@@ -770,7 +774,13 @@ program
 
       if (pendingAdminPassRotate) {
         const opsSocket = join(dataDir, "operations-server");
-        console.log("Rotating persisted admin password via operations socket...");
+        const preflight = prepareAdminPasswordRotate({
+          resetRequested: !!opts.resetAdminPass,
+          username: adminUser,
+          socketPath: opsSocket,
+          adminPassPath,
+        });
+        console.log(preflight);
         await rotateAdminPasswordViaOpsSocket(opsSocket, adminUser, adminPass);
         writeAdminPassFile(adminPassPath, adminPass + "\n");
         pendingAdminPassRotate = false;
@@ -857,7 +867,13 @@ program
 
     if (pendingAdminPassRotate) {
       const opsSocket = join(dataDir, "operations-server");
-      console.log("Rotating persisted admin password via operations socket...");
+      const preflight = prepareAdminPasswordRotate({
+        resetRequested: !!opts.resetAdminPass,
+        username: adminUser,
+        socketPath: opsSocket,
+        adminPassPath,
+      });
+      console.log(preflight);
       await rotateAdminPasswordViaOpsSocket(opsSocket, adminUser, adminPass);
       writeAdminPassFile(adminPassPath, adminPass + "\n");
       pendingAdminPassRotate = false;
