@@ -18,6 +18,7 @@ import { withEmbedGpuHealth } from "./embed-gpu.js";
 import {
   classifyPeerLiveness,
   federationPeersAllDisconnectedWarning,
+  PEER_LIVENESS_MEASURED_BY,
   summarizePeerLiveness,
 } from "./federation-peer-liveness.js";
 
@@ -385,6 +386,8 @@ export class HealthDetail extends Resource {
         // flair#1499: derive connected/down from lastSyncAt, not stored
         // status. Pairing writes `paired`; a recent lastSyncAt is connected.
         // Revoked rows are counted separately and never drive the >24h warning.
+        // flair#1146: name the measure so "connected" cannot be read as TCP.
+        // Do not substitute memory lastWrite for lastSyncAt.
         const liveness = summarizePeerLiveness(peers, nowMs);
         const peersBlock = {
           total: liveness.total,
@@ -392,6 +395,7 @@ export class HealthDetail extends Resource {
           disconnected: liveness.disconnected,
           revoked: liveness.revoked,
           unknown: liveness.unknown,
+          measuredBy: PEER_LIVENESS_MEASURED_BY,
         };
         const pendingTokens = tokens.filter(
           (t: any) => !t.consumedBy && t.expiresAt && new Date(t.expiresAt).getTime() > nowMs,
