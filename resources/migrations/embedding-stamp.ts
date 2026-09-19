@@ -135,6 +135,8 @@
  */
 import { databases } from "harper";
 import { getModelId } from "../embeddings-provider.js";
+import { harperPortValue } from "../../src/lib/harper-port-value.js";
+import { DEFAULT_HTTP_PORT } from "../a2a-url.js";
 import { currentSpaceRawForms, isCurrentSpaceStamp } from "../embedding-space-guard.js";
 import type { Migration, RunBatchResult } from "./types.js";
 import { EMBEDDING_STAMP_ID } from "./stamp-outstanding.js";
@@ -159,10 +161,30 @@ function resolveAdminAuthHeader(): string | null {
   return "Basic " + Buffer.from(`admin:${pass}`).toString("base64");
 }
 
-/** Same HTTP_PORT env resolution src/cli.ts sets on every Harper spawn (see that file's grep for HTTP_PORT). */
-function resolveSelfBaseUrl(): string {
-  const port = process.env.HTTP_PORT ?? "9926";
-  return `http://127.0.0.1:${port}`;
+/**
+ * Base URL for the loopback self-call that regenerates an embedding.
+ *
+ * ALWAYS loopback. This is the destination of a credentialed self-call —
+ * `regenViaHttpPut` sends `Authorization: Basic` carrying the admin password to
+ * it — so it must never leave the box. `FLAIR_PUBLIC_URL` names a remote /
+ * reverse-proxied origin and is deliberately ignored here, matching
+ * `a2a-url.localBaseUrl` ("never the public/proxy URL"): two self-call
+ * resolvers, both pinned to loopback. The public-facing resolvers
+ * (oauth-discovery, AdminInstance, XAA) honour `FLAIR_PUBLIC_URL` precisely
+ * because their output is meant to be reachable off-box; this one's output is
+ * not.
+ *
+ * `HTTP_PORT` is parsed through `harperPortValue` so a host-qualified value
+ * (`127.0.0.1:19926`) yields a valid URL rather than a doubled host. Absent
+ * (or out-of-range) falls back to `DEFAULT_HTTP_PORT` (19926) — NOT the legacy
+ * early-install 9926 this used to reach for. 9926 is Harper's OWN default bind,
+ * which is what the one boot shape that reaches this fallback actually uses: a
+ * bare `harper run .` that flair did not spawn. On a pre-March data dir that
+ * 9926 coincidentally matched the real bind; post-March 19926 does. Both are
+ * guesses — `HTTP_PORT` is the only channel carrying the truth.
+ */
+export function resolveSelfBaseUrl(env: NodeJS.ProcessEnv = process.env): string {
+  return `http://127.0.0.1:${harperPortValue(env.HTTP_PORT) ?? DEFAULT_HTTP_PORT}`;
 }
 
 /**
