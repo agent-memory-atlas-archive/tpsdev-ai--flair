@@ -11,7 +11,7 @@
  * Exit 0 prints `PASS: plain-tree upgrade lane`. Any missing assertion exits 1.
  */
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -50,8 +50,31 @@ function fail(message: string, extra = ""): never {
   process.exit(1);
 }
 
-const home = homedir();
-const scratch = mkdtempSync(join(tmpdir(), "flair-plain-tree-lane-"));
+// Canonicalize BOTH paths the fixture writes and later asserts on.
+//
+// The product realpaths a tree before it prints or matches anything
+// (canonicalPath, src/lib/upgrade-exec-path.ts; used at
+// upgrade-plain-tree.ts:157,:261,:355). A fixture holding the LEXICAL path
+// therefore disagrees with every path the product emits. One root cause,
+// two symptoms, in this order:
+//   1. the banner assertion below fails -- the product prints
+//      "Plain-tree install: /private/var/..." while the fixture asserts
+//      "/var/..."  ("missing plain-tree banner for the packed extract");
+//   2. unit discovery misses -- the unit text names the lexical path, the
+//      lookup asks for the canonical one ("no systemd unit found").
+//
+// This is NOT a platform fact. The lane never invokes systemctl: it writes
+// a unit file and asserts on `--check` PLAN output, which is filesystem +
+// stdout and runs anywhere. What varies is whether TMPDIR/HOME sit behind a
+// symlink -- the macOS default (/var -> /private/var, /tmp -> /private/tmp)
+// and not usually Linux, so CI was green by accident of the runner's
+// filesystem layout. A Linux host with a symlinked /tmp fails identically,
+// which is why a platform gate would key on the wrong variable.
+//
+// realpath is a no-op where the path is already canonical. Refs #1753;
+// the product-side half is #1758.
+const home = realpathSync(homedir());
+const scratch = realpathSync(mkdtempSync(join(tmpdir(), "flair-plain-tree-lane-")));
 const tree = join(scratch, "spoke");
 const cleanup = (): void => {
   rmSync(scratch, { recursive: true, force: true });
