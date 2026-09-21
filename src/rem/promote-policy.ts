@@ -234,3 +234,53 @@ export function validateHumanReviewerId(reviewerId: string): string | null {
   return null;
 }
 
+// ─── Structural-truncation signal (flair#1756 slice 2) ───────────────────────
+// The SINGLE definition of the structural-truncation signal. The GATE for it
+// lives server-side in resources/auto-promote-lib.ts (decideAutoPromote — the
+// UNATTENDED path), which IMPORTS these from here. The direction is deliberate
+// and established in this repo: a server file may import a PURE helper from src/
+// (resources/PromoteMemoryCandidate.ts and resources/soul-adk-guard.ts already
+// import this very module); it is a CLI file importing FROM resources/ that does
+// not survive npm packaging. Defining it here lets the CLI side
+// (src/commands/rem.ts, `flair rem candidates`) and the server gate share ONE
+// implementation rather than a hand-kept pair.
+//
+// Detects STRUCTURAL imbalance (unclosed/unmatched backtick, paren, bracket,
+// brace) — NOT semantic completeness. A balanced claim can still be a fragment.
+// The check counts delimiters without interpreting context, so a complete claim
+// that merely DISCUSSES an unmatched delimiter is also flagged/refused
+// (fail-closed; nothing is lost — the candidate stays pending for the human
+// `rem promote` path).
+
+const STRUCTURAL_CLOSERS: Record<string, string> = { ")": "(", "]": "[", "}": "{" };
+
+/**
+ * Return a description of the STRUCTURAL imbalance in `claim` (an unmatched or
+ * closing-first bracket, an unclosed opener, or an odd number of backticks), or
+ * null if it is balanced. Pure. The description is for diagnostics only — it is
+ * NOT surfaced as a claim about completeness.
+ */
+export function structuralImbalance(claim: string): string | null {
+  const stack: string[] = [];
+  for (const ch of claim) {
+    if (ch === "(" || ch === "[" || ch === "{") {
+      stack.push(ch);
+    } else if (ch in STRUCTURAL_CLOSERS) {
+      if (stack.pop() !== STRUCTURAL_CLOSERS[ch]) return `unmatched '${ch}'`;
+    }
+  }
+  if (stack.length > 0) return `unclosed '${stack[stack.length - 1]}'`;
+  if (((claim.match(/`/g) ?? []).length) % 2 !== 0) return "unbalanced backtick";
+  return null;
+}
+
+/**
+ * True iff `claim` ends with terminal punctuation (optionally followed by a
+ * closing quote/bracket). This is a FLAG INPUT ONLY, never a refusal: plenty of
+ * legitimate claims end without a full stop, and on the UNATTENDED path a false
+ * refusal is silent. `flair rem candidates` surfaces it for the human reviewer.
+ */
+export function hasTerminalPunctuation(claim: string): boolean {
+  return /[.!?]["')\]}»”’]*$/.test(claim.trimEnd());
+}
+
