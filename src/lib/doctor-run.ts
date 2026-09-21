@@ -40,7 +40,7 @@ import {
   type Harness,
   type HookMutationResult,
 } from "../hook-install.js";
-import { findUnsafeWiredPins, sessionStartHookPinFindings, staleHookRemedy, staleMcpClientPins } from "./owned-pins.js";
+import { findUnsafeWiredPins, mcpClientPinFindings, sessionStartHookPinFindings, staleHookRemedy } from "./owned-pins.js";
 import { flairCliVersion, isResolvedVersion } from "./mcp-spec.js";
 import { unsafeAdapterPinDetail } from "./stale-client-pin.js";
 import {
@@ -50,8 +50,9 @@ import {
   type LaunchdManagement,
 } from "./launchd-management.js";
 
-/** Status of one catalog member. `unrun` is a first-class state, not a skip. */
-export type DoctorCheckStatus = "pass" | "fail" | "skip" | "unrun";
+/** Status of one catalog member. `unrun` is a first-class state, not a skip.
+ *  `warn` is a non-blocking finding (reported, never counted as an issue). */
+export type DoctorCheckStatus = "pass" | "fail" | "skip" | "unrun" | "warn";
 
 export interface DoctorCheckResult {
   id: string;
@@ -168,17 +169,41 @@ function runMcpBlock(ctx: DoctorRunContext): DoctorCheckResult {
   }
   const expected = flairCliVersion();
   if (isResolvedVersion(expected)) {
-    const stale = staleMcpClientPins(ctx.homeDir, expected)
-      .filter((r) => wired.includes(r.target.id as (typeof MCP_CLIENT_IDS)[number]));
-    if (stale.length > 0) {
-      const first = stale[0]!;
-      const detail = stale.length === 1
-        ? `MCP server (${first.target.id}): pinned to flair-mcp@${first.pin} (installed CLI is ${expected})`
-        : `MCP server: stale pins ${stale.map((s) => `${s.target.id}@${s.pin}`).join(", ")} (installed CLI is ${expected})`;
-      return result(id, label, "fail", {
-        detail,
-        remedy: "flair upgrade",
-      });
+    const findings = mcpClientPinFindings(ctx.homeDir, expected)
+      .filter((f) => wired.includes(f.reading.target.id as (typeof MCP_CLIENT_IDS)[number]));
+    if (findings.length > 0) {
+      // flair#1789: the same three-valued treatment the SessionStart hook gets.
+      //   behind  -> stale, blocking: today's error + `flair upgrade`.
+      //   ahead   -> a held PASS: the refresh HOLDS an ahead pin (re-pinning
+      //              would LOWER it), so a failure here would be a dead-end
+      //              remedy that cannot act.
+      //   unknown -> a pin we cannot compare: its own non-blocking warn, naming
+      //              the raw value; the refresh holds it too, so it is not a
+      //              failure and is never worded as an old adapter.
+      const behind = findings.filter((f) => f.direction === "behind");
+      const unknownFindings = findings.filter((f) => f.direction === "unknown");
+      const aheadFindings = findings.filter((f) => f.direction === "ahead");
+      if (behind.length > 0) {
+        const readings = behind.map((f) => f.reading);
+        const first = readings[0]!;
+        const detail = behind.length === 1
+          ? `MCP server (${first.target.id}): pinned to flair-mcp@${first.pin} (installed CLI is ${expected})`
+          : `MCP server: stale pins ${readings.map((r) => `${r.target.id}@${r.pin}`).join(", ")} (installed CLI is ${expected})`;
+        return result(id, label, "fail", {
+          detail,
+          remedy: "flair upgrade",
+        });
+      }
+      if (unknownFindings.length > 0) {
+        const detail = unknownFindings.length === 1
+          ? `MCP server (${unknownFindings[0]!.reading.target.id}): pin is not a version I can compare: ${unknownFindings[0]!.reading.pin} — not re-pinned; edit the client config or run flair init if this is unintended`
+          : `MCP server: pins I cannot compare: ${unknownFindings.map((f) => `${f.reading.target.id}@${f.reading.pin}`).join(", ")} — not re-pinned; edit the client config or run flair init if this is unintended`;
+        return result(id, label, "warn", { detail });
+      }
+      const aheadDetail = aheadFindings.length === 1
+        ? `MCP server (${aheadFindings[0]!.reading.target.id}): pinned to flair-mcp@${aheadFindings[0]!.reading.pin}, ahead of the installed CLI ${expected} — held`
+        : `MCP server: pins ahead of the installed CLI ${expected} — held (${aheadFindings.map((f) => `${f.reading.target.id}@${f.reading.pin}`).join(", ")})`;
+      return result(id, label, "pass", { detail: aheadDetail });
     }
   }
   return result(id, label, "pass", { detail: `configured for ${wired.join(", ")}` });
@@ -293,12 +318,15 @@ function runSessionStartHook(ctx: DoctorRunContext): DoctorCheckResult {
     const findings = sessionStartHookPinFindings(ctx.homeDir, expected)
       .filter((f) => harnesses.includes(f.reading.target.id as Harness));
     if (findings.length > 0) {
-      // flair#1778 follow-up: PIN DIRECTION matters. A pin AHEAD of the running
-      // CLI is not a stale pin to fix — re-pinning would LOWER it, and the
-      // refresh holds it. It is a PASS, not a failure, so doctor (and
-      // `doctor --fix`) does not count it as an issue and exits on the state it
-      // deliberately preserves. Only a pin BEHIND the running CLI is stale.
-      const behind = findings.filter((f) => f.direction !== "ahead");
+      // flair#1778 follow-up: PIN DIRECTION matters, and there are THREE cases.
+      //   behind  -> stale, blocking: today's error + re-pin.
+      //   ahead   -> a held PASS: re-pinning would LOWER it, so it is not a
+      //              failure and doctor exits on the state it preserves.
+      //   unknown -> a pin we cannot compare: its OWN warn finding. It is NOT
+      //              blocking, NOT auto-re-pinned, and never worded as an old
+      //              adapter — the guard holds an unreadable pin.
+      const behind = findings.filter((f) => f.direction === "behind");
+      const unknownFindings = findings.filter((f) => f.direction === "unknown");
       const aheadFindings = findings.filter((f) => f.direction === "ahead");
       if (behind.length > 0) {
         const readings = behind.map((f) => f.reading);
@@ -310,6 +338,12 @@ function runSessionStartHook(ctx: DoctorRunContext): DoctorCheckResult {
           detail,
           remedy: staleHookRemedy(readings),
         });
+      }
+      if (unknownFindings.length > 0) {
+        const detail = unknownFindings.length === 1
+          ? `SessionStart hook (${unknownFindings[0]!.reading.target.id}): pin is not a version I can compare: ${unknownFindings[0]!.reading.pin} — not re-pinned; re-run flair init or edit the hook if this is unintended`
+          : `SessionStart hook: pins I cannot compare: ${unknownFindings.map((f) => `${f.reading.target.id}@${f.reading.pin}`).join(", ")} — not re-pinned; re-run flair init or edit the hook if this is unintended`;
+        return result(id, label, "warn", { detail });
       }
       const aheadDetail = aheadFindings.length === 1
         ? `SessionStart hook (${aheadFindings[0]!.reading.target.id}): pinned to flair-mcp@${aheadFindings[0]!.reading.pin}, ahead of the installed CLI ${expected} — held`
@@ -667,7 +701,7 @@ export function renderCatalogDoctorLines(
   run: DoctorRun,
 ): { icon: "ok" | "error" | "warn"; line: string }[] {
   return run.results.map((r) => {
-    const icon = r.status === "pass" || r.status === "skip" ? "ok" : r.status === "unrun" ? "warn" : "error";
+    const icon = r.status === "pass" || r.status === "skip" ? "ok" : r.status === "fail" ? "error" : "warn";
     const word = r.status === "skip" ? "n/a" : r.status;
     const detail = r.detail ? ` — ${r.detail}` : "";
     return { icon, line: `${r.label}: ${word}${detail}` };

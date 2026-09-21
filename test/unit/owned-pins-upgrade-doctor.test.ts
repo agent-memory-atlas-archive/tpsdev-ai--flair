@@ -7,6 +7,7 @@ import {
   findUnsafeWiredPins,
   listOwnedPinTargets,
   ownedPinRefreshShouldReport,
+  pinDirection,
   refreshOwnedPins,
   staleMcpClientPins,
   staleSessionStartHookPins,
@@ -431,5 +432,103 @@ describe("flair#1778 follow-up — doctor classifies SessionStart-hook pin DIREC
     expect(hook?.status).toBe("fail");
     expect(hook?.remedy).toBe("flair hook install");
     expect(blockingIds(isoHome)).toContain("session-start-hook");
+  });
+});
+
+describe("pinDirection — three-valued, unknown when not comparable (flair#1778)", () => {
+  it("ahead/behind for strict semver; unknown for every unreadable-side case", () => {
+    expect(pinDirection("0.55.0", "0.54.2")).toBe("ahead");
+    expect(pinDirection("0.54.2", "0.55.0")).toBe("behind");
+    expect(pinDirection("0.55.1.rc", "0.55.1")).toBe("unknown"); // invalid pin
+    expect(pinDirection("0.55.1", "0.55.1.rc")).toBe("unknown"); // invalid target
+    expect(pinDirection("not-a-version", "garbage")).toBe("unknown"); // both invalid
+  });
+});
+
+describe("flair#1778 — an UNREADABLE pin FAILS CLOSED (never silently overwritten)", () => {
+  const RAW = "0.55.1.rc";
+  const RAW_SPEC = `${FLAIR_MCP_PACKAGE}@${RAW}`;
+
+  it("hook refresh: an unreadable pin is HELD, byte-identical, and the line names the raw value", () => {
+    const p = writeHook(isoHome, "claude-code", hookCommand("local", RAW));
+    const before = readFileSync(p, "utf-8");
+    const results = refreshOwnedPins({ homeDir: isoHome, agentId: "local", flairUrl: "http://127.0.0.1:9926" });
+    expect(readFileSync(p, "utf-8")).toBe(before);
+    const held = results.find((r) => r.target.kind === "session-start-hook" && r.action === "hold");
+    expect(held).toBeDefined();
+    expect(held?.message).toContain(RAW);
+    expect(held?.message).toContain("not a version I can compare");
+  });
+
+  it("MCP refresh: an unreadable pin is HELD, byte-identical, and the line names the raw value", () => {
+    const p = writeClaudeMcp(isoHome, RAW_SPEC, "local");
+    const before = readFileSync(p, "utf-8");
+    const results = refreshOwnedPins({ homeDir: isoHome, agentId: "local", flairUrl: "http://127.0.0.1:9926" });
+    expect(readFileSync(p, "utf-8")).toBe(before);
+    const held = results.find((r) => r.target.kind === "mcp-client" && r.action === "hold");
+    expect(held).toBeDefined();
+    expect(held?.message).toContain(RAW);
+    expect(held?.message).toContain("not a version I can compare");
+  });
+
+  it("catalog: an unreadable hook pin is a NON-BLOCKING warn, not a stale failure", () => {
+    writeClaudeMcp(isoHome, CURRENT_SPEC, "local");
+    writeHook(isoHome, "claude-code", hookCommand("local", RAW));
+    const run = doctorOn(isoHome, ["claude-code"]);
+    const hook = run.results.find((r) => r.id === "session-start-hook");
+    expect(hook?.status).toBe("warn");
+    expect(hook?.detail ?? "").toContain(RAW);
+    expect(hook?.detail ?? "").toContain("not a version I can compare");
+    expect(hook?.remedy).toBeUndefined();
+    // Not counted as blocking (the exit-code source).
+    expect(run.results.filter((r) => r.status === "fail" || r.status === "unrun").map((r) => r.id)).not.toContain("session-start-hook");
+    // Rendered with the warn icon, never the error one.
+    const row = renderCatalogDoctorLines(run).find((r) => r.line.includes("SessionStart hook"));
+    expect(row?.icon).toBe("warn");
+  });
+});
+
+describe("flair#1789 — doctor classifies the MCP-block pin DIRECTION", () => {
+  const dirCore = parseSemverCore(INSTALLED);
+  if (!dirCore) throw new Error(`CLI version is not semver: ${INSTALLED}`);
+  const AHEAD_VER = `${dirCore[0]}.${dirCore[1]}.${dirCore[2] + 1}`;
+  const RAW = "0.55.1.rc";
+
+  function mcpBlocking(home: string): boolean {
+    return doctorOn(home, ["claude-code"]).results
+      .filter((r) => r.status === "fail" || r.status === "unrun")
+      .some((r) => r.id === "mcp-block");
+  }
+
+  it("an MCP pin AHEAD of the running CLI is a held PASS (no remedy, not blocking)", () => {
+    writeClaudeMcp(isoHome, `${FLAIR_MCP_PACKAGE}@${AHEAD_VER}`, "local");
+    const run = doctorOn(isoHome, ["claude-code"]);
+    const mcp = run.results.find((r) => r.id === "mcp-block");
+    expect(mcp?.status).toBe("pass");
+    expect(mcp?.detail ?? "").toContain("ahead of the installed CLI");
+    expect(mcp?.remedy).toBeUndefined();
+    expect(mcpBlocking(isoHome)).toBe(false);
+  });
+
+  it("an UNREADABLE MCP pin is a NON-BLOCKING warn naming the raw value", () => {
+    writeClaudeMcp(isoHome, `${FLAIR_MCP_PACKAGE}@${RAW}`, "local");
+    const run = doctorOn(isoHome, ["claude-code"]);
+    const mcp = run.results.find((r) => r.id === "mcp-block");
+    expect(mcp?.status).toBe("warn");
+    expect(mcp?.detail ?? "").toContain(RAW);
+    expect(mcp?.detail ?? "").toContain("not a version I can compare");
+    expect(mcp?.remedy).toBeUndefined();
+    expect(mcpBlocking(isoHome)).toBe(false);
+    const row = renderCatalogDoctorLines(run).find((r) => r.line.includes("MCP server block"));
+    expect(row?.icon).toBe("warn");
+  });
+
+  it("an MCP pin BEHIND the running CLI is still a blocking fail + flair upgrade", () => {
+    writeClaudeMcp(isoHome, STALE_SPEC, "local");
+    const run = doctorOn(isoHome, ["claude-code"]);
+    const mcp = run.results.find((r) => r.id === "mcp-block");
+    expect(mcp?.status).toBe("fail");
+    expect(mcp?.remedy).toBe("flair upgrade");
+    expect(mcpBlocking(isoHome)).toBe(true);
   });
 });
