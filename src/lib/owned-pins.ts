@@ -270,6 +270,100 @@ export function staleHookRemedy(readings: readonly OwnedPinReading[]): string {
   return [...new Set(harnesses)].map((h) => hookInstallHint(h)).join(" ; ");
 }
 
+export type PinDirection = "ahead" | "behind" | "unknown";
+
+/**
+ * Direction of an owned pin relative to `target` (the version a refresh would
+ * write — the running CLI's). Uses the ONE comparison #1786 introduced
+ * (`isPinDowngrade`) so no call site re-derives the ordering itself.
+ *
+ *   pin > target           -> "ahead"   (writing target over it would LOWER it)
+ *   pin < target           -> "behind"
+ *   equal / not comparable -> "unknown"
+ */
+export function pinDirection(pin: string | null | undefined, target: string | null | undefined): PinDirection {
+  if (isPinDowngrade(pin, target)) return "ahead";
+  if (isPinDowngrade(target, pin)) return "behind";
+  return "unknown";
+}
+
+export interface SessionStartHookPinFinding {
+  reading: OwnedPinReading;
+  direction: PinDirection;
+}
+
+/**
+ * Stale SessionStart-hook pins, each annotated with its direction — the ONE
+ * place a caller goes for "which way is this pin off" (flair#1778 follow-up).
+ * SessionStart hooks only: an MCP-client pin that is ahead is a different
+ * surface with its own rendering.
+ */
+export function sessionStartHookPinFindings(
+  homeDir: string,
+  expectedVersion: string = flairCliVersion(),
+): SessionStartHookPinFinding[] {
+  return staleSessionStartHookPins(homeDir, expectedVersion).map((reading) => ({
+    reading,
+    direction: pinDirection(reading.pin, expectedVersion),
+  }));
+}
+
+/**
+ * The ONE hold line a refresh prints when it refuses to lower an owned pin.
+ * Phrased neutrally ("a pin is never lowered") because both `flair upgrade`'s
+ * refresh and `flair doctor --fix` print it — no per-caller copy.
+ */
+function heldPinMessage(id: string, pin: string, runningCli: string): string {
+  return `${id}: keeping pinned ${pin} (running CLI ${runningCli} is older — a pin is never lowered)`;
+}
+
+/**
+ * The ONE SessionStart-hook re-pin guard (flair#1778 D4), shared by
+ * `flair upgrade`'s pin refresh and `flair doctor --fix`.
+ *
+ * Rebuilds an already-wired hook to the running CLI's version, but never
+ * LOWERS an owned pin: when the running CLI is older than the pin present
+ * (`isPinDowngrade`), it HOLDS — `action: "hold"`, with a line naming both
+ * versions — instead of rewriting. There is no second copy of this decision:
+ * `flair doctor --fix`'s stale-hook repair routes through here too, so a
+ * `doctor --fix` on an ahead pin holds exactly as the upgrade refresh does
+ * (flair#1778 slice-1 follow-up, N4).
+ *
+ * NEVER adds a hook (repinSessionStartHook's contract); a home with no hook is
+ * a clean skip.
+ */
+export function repinSessionStartHookGuarded(
+  homeDir: string,
+  harness: Harness,
+  target?: OwnedPinTarget,
+): OwnedPinRefreshResult {
+  const resolved: OwnedPinTarget = target ?? listOwnedPinTargets(homeDir).find(
+    (t) => t.kind === "session-start-hook" && t.id === harness,
+  ) ?? {
+    kind: "session-start-hook",
+    id: harness,
+    path: hookSettingsPath(homeDir, harness),
+    displayPath: hookSettingsPath(homeDir, harness),
+  };
+  const wouldWrite = flairCliVersion();
+  const existing = readOwnedPin(resolved, homeDir).pin;
+  if (isPinDowngrade(existing, wouldWrite)) {
+    return {
+      target: resolved,
+      action: "hold",
+      ok: true,
+      message: heldPinMessage(resolved.id, existing as string, wouldWrite),
+    };
+  }
+  const repin = repinSessionStartHook(homeDir, harness);
+  return {
+    target: resolved,
+    action: repin.action,
+    ok: repin.ok,
+    message: repin.message,
+  };
+}
+
 /**
  * Refresh every already-wired owned pin to the running CLI's spec.
  *
@@ -290,29 +384,10 @@ export function refreshOwnedPins(opts: RefreshOwnedPinsOptions): OwnedPinRefresh
   return withHome(homeDir, () => {
     for (const target of targets) {
       if (target.kind === "session-start-hook") {
-        const harness = target.id as Harness;
-        // flair#1778 D4: never re-pin a hook DOWN. The rebuild would write the
-        // running CLI's version; if that is LOWER than the pin present, hold it
-        // rather than lower the pin (an unrelated package upgrading must not
-        // drag an ahead pin down).
-        const existingHookPin = readOwnedPin(target, homeDir).pin;
-        const wouldWriteHook = flairCliVersion();
-        if (isPinDowngrade(existingHookPin, wouldWriteHook)) {
-          results.push({
-            target,
-            action: "hold",
-            ok: true,
-            message: `${target.id}: keeping pinned ${existingHookPin} (running CLI ${wouldWriteHook} is older — the refresh never lowers a pin)`,
-          });
-          continue;
-        }
-        const repin = repinSessionStartHook(homeDir, harness);
-        results.push({
-          target,
-          action: repin.action,
-          ok: repin.ok,
-          message: repin.message,
-        });
+        // flair#1778 D4: never re-pin a hook DOWN. The guard lives in ONE place
+        // (repinSessionStartHookGuarded) so `flair doctor --fix` shares it
+        // rather than growing a second implementation.
+        results.push(repinSessionStartHookGuarded(homeDir, target.id as Harness, target));
         continue;
       }
 
@@ -359,7 +434,7 @@ export function refreshOwnedPins(opts: RefreshOwnedPinsOptions): OwnedPinRefresh
           target,
           action: "hold",
           ok: true,
-          message: `${target.id}: keeping pinned ${before} (running CLI ${wouldWritePin} is older — the refresh never lowers a pin)`,
+          message: heldPinMessage(target.id, before as string, wouldWritePin),
         });
         continue;
       }

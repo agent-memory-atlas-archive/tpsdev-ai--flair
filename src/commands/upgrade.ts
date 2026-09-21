@@ -1226,11 +1226,19 @@ program
     }
 
     if (outdated.length === 0 && missing.length === 0) {
-      // An install AHEAD of latest is not an upgrade (flair#1778): say "No
-      // upgrades available" rather than "Everything is up to date", which would
-      // claim a convergence we cannot see.
+      // An install AHEAD of latest is not an upgrade (flair#1778), and neither
+      // is one whose installed version we could not PARSE: "unknown" is not
+      // evidence of convergence, so "✅ Everything is up to date." would claim
+      // more than we can see (flair#1778 slice-1 follow-up, N1). Prefer the
+      // neutral summary whenever EITHER state is present, and for an
+      // unparseable version name the package and the raw string that could not
+      // be parsed — the operator gets to see what was unreadable.
       const anyAhead = findings.some((f) => f.status === "ahead");
-      console.log(anyAhead ? "\nNo upgrades available." : "\n✅ Everything is up to date.");
+      const unknownFindings = findings.filter((f) => f.status === "unknown");
+      for (const f of unknownFindings) {
+        console.log(`\n❔ ${f.name}: could not parse installed version ${JSON.stringify(f.installed)} — not reporting it as up to date.`);
+      }
+      console.log(anyAhead || unknownFindings.length > 0 ? "\nNo upgrades available." : "\n✅ Everything is up to date.");
       return;
     }
 
@@ -1285,7 +1293,16 @@ program
       if (missing.length > 0) {
         const npmMissing = missing.filter((f) => f.name !== FLAIR_MCP_PACKAGE);
         const mcpMissing = missing.some((f) => f.name === FLAIR_MCP_PACKAGE);
-        console.log(`\n❔ ${missing.length} package${missing.length > 1 ? "s" : ""} not detected — all detected packages are up to date.`);
+        // flair#1778 follow-up: "all detected packages are up to date" is the
+        // same false-convergence claim the no-upgrade summary above avoids, so
+        // guard it with the same condition — when any detected package is
+        // `ahead` or `unknown`, say only that there are no upgrades for the
+        // rest, never that they are up to date.
+        const anyAheadOrUnknown = findings.some((f) => f.status === "ahead" || f.status === "unknown");
+        const tail = anyAheadOrUnknown
+          ? "no upgrades available for the rest"
+          : "all detected packages are up to date";
+        console.log(`\n❔ ${missing.length} package${missing.length > 1 ? "s" : ""} not detected — ${tail}.`);
         if (npmMissing.length > 0) {
           console.log(`   Install missing: npm install -g ${npmMissing.map((f) => f.name).join(" ")}`);
         }
