@@ -10,7 +10,13 @@ import { webcrypto } from 'node:crypto';
 const { subtle } = webcrypto;
 
 const FLAIR_URL = process.env.FLAIR_URL || 'http://127.0.0.1:9926';
-const AGENT_ID = process.env.FLAIR_AGENT_ID || 'flint';
+// The signing identity. `FLAIR_AGENT_ID` or `--agent <id>` is explicit; a
+// shipped default is a trust anchor by omission (flair#1816), so the default
+// only serves read-only actions — mutations refuse without one, resolved in
+// the argv section below once the action is known.
+const DEFAULT_AGENT_ID = 'flint';
+const MUTATING_ACTIONS = new Set(['write', 'set', 'delete']);
+let AGENT_ID = DEFAULT_AGENT_ID;
 
 // RFC 8410 PKCS8 prefix for an Ed25519 private key carrying a bare 32-byte seed.
 // `flair agent add` writes that bare seed; wrapping it here means no operator ever
@@ -100,6 +106,37 @@ if (!resource || !action) {
   console.error('Usage: flair-client.mjs <memory|soul|agent> <list|get|write|set|delete|search> [args]');
   process.exit(1);
 }
+
+// Signing identity (flair#1816): FLAIR_AGENT_ID wins, then an explicit
+// `--agent <id>`. A MUTATING action without either refuses instead of
+// defaulting — the old shipped default signed every forgotten caller as
+// 'flint', and ownership-scoped operations then bound to an identity nobody
+// chose. Read-only actions keep the default so `list`/`get`/`search` still
+// work for a configured host.
+const agentFlagIndex = rest.indexOf('--agent');
+const agentFromFlag = agentFlagIndex === -1 ? undefined : rest[agentFlagIndex + 1];
+if (agentFlagIndex !== -1) {
+  if (agentFromFlag === undefined || agentFromFlag === '' || agentFromFlag.startsWith('--')) {
+    console.error('--agent requires a value');
+    process.exit(1);
+  }
+  rest.splice(agentFlagIndex, 2);
+  // One removal is not a loop: a second `--agent` would survive into the
+  // positional join and land in the written content — the same flag-folding
+  // class extractFlags exists to prevent. Refuse instead (flair#1816 review).
+  if (rest.includes('--agent')) {
+    console.error('--agent may only be given once');
+    process.exit(1);
+  }
+}
+if (!process.env.FLAIR_AGENT_ID && !agentFromFlag && MUTATING_ACTIONS.has(action)) {
+  console.error(
+    `refusing to ${action}: no agent identity. Set FLAIR_AGENT_ID or pass --agent <id>. ` +
+      `A default identity would sign as a principal the caller did not choose (flair#1816).`,
+  );
+  process.exit(1);
+}
+AGENT_ID = process.env.FLAIR_AGENT_ID || agentFromFlag || DEFAULT_AGENT_ID;
 
 const table = resource.charAt(0).toUpperCase() + resource.slice(1);
 
