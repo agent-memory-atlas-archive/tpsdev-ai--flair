@@ -85,8 +85,9 @@ export interface UnwireResult {
 import { accessSync, constants, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { flairCliVersion, isResolvedVersion, mcpServerSpec } from "../lib/mcp-spec.js";
+import { FLAIR_MCP_PACKAGE, flairCliVersion, isResolvedVersion, mcpServerSpec } from "../lib/mcp-spec.js";
 import { decodeWiringSpec, wiringPinString } from "../lib/wiring-spec.js";
+import { decidePinWrite, type PinWriteDecision } from "../lib/pin-write-guard.js";
 
 /**
  * Resolve the user's home dir. Prefer the live HOME/USERPROFILE env over
@@ -258,16 +259,20 @@ export function removeCodexFlairBlock(raw: string): string {
  * CURRENT pinned mcpServerSpec()? Pure string scan — no TOML parser needed
  * (same rationale as codexConfigHasFlairSection).
  */
-function codexFlairSectionHasCurrentPin(raw: string): boolean {
+function codexFlairSectionText(raw: string): string | null {
   const idx = raw.indexOf("[mcp_servers.flair]");
-  if (idx === -1) return false;
+  if (idx === -1) return null;
   const after = raw.slice(idx);
   // Find the end of the section: the next top-level [header] that is NOT a
   // sub-table of mcp_servers.flair (e.g. [mcp_servers.flair.env] is part of
   // the same logical section and must not terminate the scan).
   const nextHeader = after.slice("[mcp_servers.flair]".length).search(/\n\[(?!mcp_servers\.flair\.)/);
-  const section = nextHeader === -1 ? after : after.slice(0, "[mcp_servers.flair]".length + nextHeader);
-  return section.includes(mcpServerSpec());
+  return nextHeader === -1 ? after : after.slice(0, "[mcp_servers.flair]".length + nextHeader);
+}
+
+function codexFlairSectionHasCurrentPin(raw: string): boolean {
+  const section = codexFlairSectionText(raw);
+  return section !== null && section.includes(mcpServerSpec());
 }
 
 /**
@@ -322,6 +327,18 @@ function wireJsonMcp(
     // A matching pin stays a no-op (idempotent); only a stale pin triggers a re-write.
     if (urlAgentMatch && argsMatch) {
       return { ok: true, message: `${label}: already wired in ${display}` };
+    }
+    // flair#1778 slice 2c-i-a2: a mismatch above is NOT automatically a
+    // re-write — never LOWER the existing pin, and never overwrite a
+    // range/tag/unsupported spec (see pin-write-guard.ts for the matrix).
+    const decision = decidePinWrite({
+      pkg: FLAIR_MCP_PACKAGE,
+      entry: `${label} config ${display}`,
+      existingText: existing ? JSON.stringify(existing) : null,
+      runningVersion: flairCliVersion(),
+    });
+    if (decision.action !== "write") {
+      return { ok: true, message: decision.line! };
     }
     config.mcpServers.flair = flairMcpEntry(env);
     mkdirSync(dirname(configPath), { recursive: true });
@@ -582,15 +599,26 @@ function _wirePi(env: WireEnv): { ok: boolean; message: string } {
       throw new Error(`"extensions" exists but is not an array — not rewriting it`);
     }
 
-    // The #1346 trap: npm: pi-flair specs under `extensions`. Collect + drop.
-    let movedFromExtensions = false;
+    // The #1346 trap: npm: pi-flair specs under `extensions`. pi treats an
+    // `npm:` entry there as a PATH, fails existsSync, and drops it silently —
+    // so a wired pi must MOVE it to `packages`. Collect WITHOUT mutating: the
+    // move rewrites the pin on record, so (flair#1778 2c-i-a2, fix round) it
+    // goes through the same guard as every other write, and a hold/refuse
+    // leaves BOTH arrays exactly as read.
+    let keptExtensions: unknown[] | null = null;
+    const movedSources: string[] = [];
     if (Array.isArray(config.extensions)) {
-      const kept = config.extensions.filter(
+      const kept: unknown[] = config.extensions.filter(
         (e: unknown) => !(typeof e === "string" && isPiFlairNpmSource(e)),
       );
-      movedFromExtensions = kept.length !== config.extensions.length;
-      if (movedFromExtensions) config.extensions = kept;
+      keptExtensions = kept;
+      if (kept.length !== config.extensions.length) {
+        for (const e of config.extensions) {
+          if (typeof e === "string" && isPiFlairNpmSource(e)) movedSources.push(e);
+        }
+      }
     }
+    const movedFromExtensions = movedSources.length > 0;
 
     // Existing packages entry?
     let entryIndex = -1;
@@ -627,6 +655,39 @@ function _wirePi(env: WireEnv): { ok: boolean; message: string } {
       }
     }
 
+    // flair#1778 slice 2c-i-a2 (fix round): the ONE guard, on EVERY write this
+    // function makes — the `packages` refresh, the #1346 MOVE, and the
+    // create-when-absent push. What is "the pin on record"?
+    //   • a `packages` entry exists → that entry (unchanged behaviour);
+    //   • none, but misplaced `extensions` sources are being MOVED → those
+    //     sources: the HIGHEST comparable one governs and any non-comparable
+    //     one holds, so a single hold/refuse wins the group;
+    //   • neither → ABSENT (null): an unreadable version REFUSES rather than
+    //     creating an unpinned entry.
+    const pinTexts: Array<{ text: string | null; entry: string }> =
+      entrySource !== null
+        ? [{ text: entrySource, entry: `pi packages entry in ${display}` }]
+        : movedSources.length > 0
+          ? movedSources.map((text) => ({ text, entry: `pi "extensions" entry in ${display}` }))
+          : [{ text: null, entry: `pi packages entry in ${display}` }];
+    let held: PinWriteDecision | null = null;
+    for (const { text, entry } of pinTexts) {
+      const decision = decidePinWrite({
+        pkg: PI_FLAIR_PACKAGE,
+        entry,
+        existingText: text,
+        runningVersion: flairCliVersion(),
+      });
+      if (decision.action !== "write" && (held === null || decision.action === "refuse")) {
+        held = decision;
+      }
+    }
+    if (held) {
+      return { ok: true, message: held.line! };
+    }
+
+    // Only a `write` decision reaches here: apply the (deferred) move, then pin.
+    if (keptExtensions !== null) config.extensions = keptExtensions;
     config.packages = Array.isArray(config.packages) ? config.packages : [];
     let action: string;
     if (entryIndex >= 0) {
@@ -737,16 +798,48 @@ function _wireCodex(env: WireEnv): { ok: boolean; message: string } {
   try {
     if (existsSync(path)) {
       const raw = readFileSync(path, "utf-8");
+      const hasSection = codexConfigHasFlairSection(raw);
+      // flair#1778 2c-i-a2 (fix round): the decision runs FIRST, on EVERY path
+      // below — including the section-absent append, which used to be written
+      // unguarded. The old order also produced N3: the "already wired" scan
+      // compared the section text against mcpServerSpec(), which on an
+      // unreadable version is the UNPINNED spec, and a pinned section CONTAINS
+      // that bare package substring — so it matched and reported a false
+      // "already wired" instead of the refusal. Nothing is written until the
+      // decision says `write`.
+      const decision = decidePinWrite({
+        pkg: FLAIR_MCP_PACKAGE,
+        entry: `Codex config ${display}`,
+        existingText: hasSection ? codexFlairSectionText(raw) : null,
+        runningVersion: flairCliVersion(),
+      });
+      if (decision.action !== "write") {
+        return { ok: true, message: decision.line! };
+      }
+      if (!hasSection) {
+        // Genuinely absent: the decision above was consulted with an ABSENT
+        // entry, and a `write` here is today's plain append (pinned).
+        writeFileSync(path, appendCodexFlairBlock(raw, env));
+        return { ok: true, message: `Codex: wired ${display} (restart Codex to pick it up)` };
+      }
       if (codexFlairSectionHasCurrentPin(raw)) {
         return { ok: true, message: `Codex: already wired in ${display}` };
       }
-      if (codexConfigHasFlairSection(raw)) {
-        // Section exists but pin is stale — replace it.
-        writeFileSync(path, replaceCodexFlairBlock(raw, env));
-        return { ok: true, message: `Codex: refreshed pin in ${display} (restart Codex to pick it up)` };
-      }
-      writeFileSync(path, appendCodexFlairBlock(raw, env));
-      return { ok: true, message: `Codex: wired ${display} (restart Codex to pick it up)` };
+      // Pin is BEHIND (or equal) — replace it with the current one.
+      writeFileSync(path, replaceCodexFlairBlock(raw, env));
+      return { ok: true, message: `Codex: refreshed pin in ${display} (restart Codex to pick it up)` };
+    }
+    // No config file: creating one is still a version-carrying WRITE, so the
+    // decision runs first (entry ABSENT) — an unreadable version refuses and
+    // nothing is created.
+    const createDecision = decidePinWrite({
+      pkg: FLAIR_MCP_PACKAGE,
+      entry: `Codex config ${display}`,
+      existingText: null,
+      runningVersion: flairCliVersion(),
+    });
+    if (createDecision.action !== "write") {
+      return { ok: true, message: createDecision.line! };
     }
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, tomlSnippet(env) + "\n");

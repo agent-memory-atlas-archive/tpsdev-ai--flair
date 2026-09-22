@@ -18,7 +18,8 @@ import {
   resolveInitAdminPasswordRefuseReason,
   resolveInitAdminPasswordSource,
 } from "../lib/init-admin-pass.js";
-import { mcpServerSpec, unpinnedSpecWarning } from "../lib/mcp-spec.js";
+import { FLAIR_MCP_PACKAGE, flairCliVersion, mcpServerSpec, unpinnedSpecWarning } from "../lib/mcp-spec.js";
+import { decidePinWrite } from "../lib/pin-write-guard.js";
 import * as render from "../render.js";
 import { execSync, spawn } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
@@ -1189,6 +1190,26 @@ program
                 console.log(`   ✓ Claude Code already wired in ~/.claude.json`);
                 wiringResults.push({ client: "claude-code", message: "already wired", wired: true });
               } else {
+                // flair#1778 slice 2c-i-a2: a pin mismatch is NOT automatically a
+                // re-write — never LOWER the pin already in ~/.claude.json (and
+                // never overwrite a range/tag/unsupported spec, nor write when
+                // this CLI cannot read its own version).
+                const decision = decidePinWrite({
+                  pkg: FLAIR_MCP_PACKAGE,
+                  entry: "Claude Code config ~/.claude.json",
+                  existingText: existing ? JSON.stringify(existing) : null,
+                  runningVersion: flairCliVersion(),
+                });
+                if (decision.action !== "write") {
+                  console.log(`   ${render.icons.warn} ${decision.line}`);
+                  wiringResults.push({
+                    client: "claude-code",
+                    message: decision.action === "hold"
+                      ? "held the existing pin in ~/.claude.json"
+                      : "refused to write ~/.claude.json (unreadable CLI version)",
+                    wired: !!existing,
+                  });
+                } else {
                 claudeJson.mcpServers = claudeJson.mcpServers || {};
                 claudeJson.mcpServers.flair = flairMcpConfig;
                 writeFileSync(claudeJsonPath, JSON.stringify(claudeJson, null, 2));
@@ -1203,6 +1224,7 @@ program
                     : "created and wired ~/.claude.json",
                   wired: true,
                 });
+                }
               }
             } catch (err: unknown) {
               // Only a genuine read/parse/write failure lands here now (bad
@@ -1289,8 +1311,11 @@ program
       if (!opts.skipSmoke && !noMcp && clientOpt !== "none" && wiringResults.length > 0 && wiredAnyMcpClient) {
         console.log("\n   Smoke-testing MCP server...");
         try {
-          // Same spec that gets WIRED above — the smoke test must exercise the
-          // exact version the user will run, not whatever npm resolves latest to.
+          // The RUNNING CLI's own server: mcpServerSpec() pins to THIS
+          // CLI's version. That is not necessarily the version a client
+          // config ends up keeping — on a HELD pin the config is deliberately
+          // left on a HIGHER version than this CLI — so the smoke exercises
+          // what this CLI can run, not the held pin.
           const mcpProc = spawn("npx", ["-y", mcpServerSpec()], {
             env: { ...process.env, FLAIR_AGENT_ID: agentId, FLAIR_URL: httpUrl },
             stdio: ["pipe", "pipe", "pipe"],
@@ -1325,12 +1350,12 @@ program
             for (const line of lines) {
               const parsed = JSON.parse(line);
               if (parsed.jsonrpc === "2.0" && parsed.id === 1 && !parsed.error) {
-                console.log("   ✓ MCP server responded");
+                console.log(`   ✓ MCP server responded (this CLI's ${mcpServerSpec()} server, not the pinned config's)`);
                 break;
               }
             }
           } catch {
-            console.log("   ⚠ MCP server responded but response could not be parsed");
+            console.log("   ⚠ MCP server responded but response could not be parsed (this CLI's server, not the pinned config's)");
           } finally {
             // Reap the child even on the resolve path: the MCP server exits on
             // stdin close, but the `npx` wrapper can linger holding the loop.
