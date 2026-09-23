@@ -14,13 +14,13 @@
  * it here automatically — no second list to forget on the next upgrade.
  */
 
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, lstatSync, readFileSync, statSync } from "node:fs";
+import { dirname, join } from "node:path";
 import {
   ALL_CLIENTS,
   clientConfigPath,
+  repinJsonMcpPin,
   type ClientId,
-  type WireEnv,
 } from "../install/clients.js";
 import {
   checkSessionStartHook,
@@ -57,6 +57,12 @@ export interface OwnedPinReading {
   target: OwnedPinTarget;
   /** True when this file already carries Flair wiring we may refresh / judge. */
   present: boolean;
+  /** STRUCTURAL presence, separate from identity (flair#1834 A1 item 1): true
+   *  when a Flair MCP entry exists at all, whether or not it names a
+   *  FLAIR_AGENT_ID. A refresh/pin finding keys off THIS (a pin refresh
+   *  preserves whatever identity the entry carries); doctor's wiring offer
+   *  keeps `present` (entry-without-identity stays distinct from no-entry). */
+  entryExists: boolean;
   /** Concrete `@tpsdev-ai/flair-mcp@<ver>` pin, or null if unpinned / absent. */
   pin: string | null;
 }
@@ -70,19 +76,17 @@ export interface OwnedPinRefreshResult {
 
 export interface RefreshOwnedPinsOptions {
   homeDir: string;
-  /** Required to refresh MCP client pins. Hook re-pin reads the agent from the hook. */
-  agentId?: string | null;
-  flairUrl?: string;
   /**
-   * Restrict the refresh to specific targets, each carrying the agent id / URL
-   * to wire (flair#1779). When set, ONLY these targets are visited.
+   * Restrict the refresh to specific targets (kind + id). When set, ONLY these
+   * targets are visited (flair#1779).
    *
    * `flair doctor --fix` uses this to re-pin a behind MCP-client block through
-   * the SAME guarded writer the upgrade refresh uses — and to preserve each
-   * block's OWN agent id and FLAIR_URL rather than upgrade's single resolved
-   * identity. Upgrading the one function beats a second writer.
+   * the SAME guarded writer the upgrade refresh uses. flair#1834 A1 removed the
+   * per-target `agentId`/`flairUrl` overrides: the JSON writer is now pin-only,
+   * so it preserves each entry's OWN identity rather than rewriting it from a
+   * host-wide guess. Only kind/id remain.
    */
-  targets?: ReadonlyArray<{ kind: OwnedPinKind; id: string; agentId?: string | null; flairUrl?: string }>;
+  targets?: ReadonlyArray<{ kind: OwnedPinKind; id: string }>;
 }
 
 function withHome<T>(homeDir: string, fn: () => T): T {
@@ -147,6 +151,7 @@ export function readOwnedPin(target: OwnedPinTarget, homeDir: string): OwnedPinR
     return {
       target,
       present,
+      entryExists: present,
       pin: present ? wiringPinString(decodeWiringSpec(hook.command ?? "", FLAIR_MCP_PACKAGE)) : null,
     };
   }
@@ -155,7 +160,10 @@ export function readOwnedPin(target: OwnedPinTarget, homeDir: string): OwnedPinR
   return {
     target,
     present: block.present,
-    pin: block.present ? wiringPinString(decodeWiringSpec(text, FLAIR_MCP_PACKAGE)) : null,
+    entryExists: block.entryExists,
+    // Read the pin whenever the ENTRY exists — an entry without an identity is
+    // still a pin we own and may refresh (flair#1834 A1 item 1).
+    pin: block.entryExists ? wiringPinString(decodeWiringSpec(text, FLAIR_MCP_PACKAGE)) : null,
   };
 }
 
@@ -173,7 +181,7 @@ export function staleOwnedPins(
 ): OwnedPinReading[] {
   if (!isResolvedVersion(expectedVersion)) return [];
   return readOwnedPins(homeDir).filter(
-    (r) => r.present && r.pin !== null && r.pin !== expectedVersion,
+    (r) => r.entryExists && r.pin !== null && r.pin !== expectedVersion,
   );
 }
 
@@ -225,7 +233,7 @@ export function findUnsafeWiredPins(homeDir: string, cwd?: string): UnsafeWiredP
 
   for (const target of listOwnedPinTargets(homeDir)) {
     const reading = readOwnedPin(target, homeDir);
-    if (!reading.present) continue;
+    if (!reading.entryExists) continue;
     const text = readFileText(target.path) ?? "";
     const surface = target.kind === "mcp-client" ? "MCP server" : "SessionStart hook";
     for (const pkg of ["flair-mcp", "flair-client"] as const) {
@@ -423,21 +431,25 @@ export function repinSessionStartHookGuarded(
 /**
  * Refresh every already-wired owned pin to the running CLI's spec.
  *
- * MCP client pins need `agentId` (the wire functions rewrite the env block).
- * SessionStart hooks do not — `repinSessionStartHook` reads the agent from
- * the existing command. A missing agentId therefore skips MCP only; it must
- * not skip hooks (that was the early-return hole in the inline upgrade path).
+ * PIN-ONLY (flair#1834 A1): the JSON MCP writer changes only the
+ * `@tpsdev-ai/flair-mcp` element of an entry's `args`, so a refresh needs NO
+ * agent id — it preserves each entry's OWN identity. SessionStart hooks were
+ * always identity-free here (`repinSessionStartHook` reads the agent from the
+ * existing command). Nothing here invents a host-wide identity.
+ *
+ * The MCP branch VISITS a target only when its entry exists or its directory
+ * exists (round 2): an absent parent (a Claude-Code-only home has no ~/.gemini
+ * etc.) is a quiet skip, while an EACCES / ELOOP / ENOTDIR parent still falls
+ * through so the refusal is reported.
  *
  * NEVER adds a hook or wires a new client.
  */
 export function refreshOwnedPins(opts: RefreshOwnedPinsOptions): OwnedPinRefreshResult[] {
   const { homeDir } = opts;
-  const flairUrl = opts.flairUrl ?? "http://127.0.0.1:9926";
-  const agentId = opts.agentId ?? null;
   const targets = listOwnedPinTargets(homeDir);
   const results: OwnedPinRefreshResult[] = [];
-  // flair#1779: an optional restriction to specific targets (kind + id), each
-  // with the agent id / URL to wire. ONLY restricted targets are visited.
+  // flair#1779: an optional restriction to specific targets (kind + id).
+  // ONLY restricted targets are visited.
   const restricted = opts.targets
     ? new Map(opts.targets.map((t) => [`${t.kind}:${t.id}`, t]))
     : null;
@@ -454,25 +466,60 @@ export function refreshOwnedPins(opts: RefreshOwnedPinsOptions): OwnedPinRefresh
         continue;
       }
 
-      const block = readClientMcpBlock(target.id as ClientId, homeDir);
-      if (!block.present) {
+      // flair#1834 A1: a JSON MCP refresh is PIN-ONLY — it changes only the
+      // `@tpsdev-ai/flair-mcp` element of the entry's args, preserving the
+      // entry's OWN identity (FLAIR_AGENT_ID, FLAIR_URL) and every other key.
+      // There is no host-wide identity to guess and no full re-wire here.
+      if (target.id === "codex") {
+        // Codex is TOML and has its own pin-only writer in PR-A2; until then
+        // its refresh SKIPS (a stale pin, never corruption). flair#1834 item 6.
         results.push({
           target,
           action: "skip",
           ok: true,
-          message: `${target.id}: not wired — skip`,
+          message: `${target.id}: refresh awaits the TOML pin-only writer — skip`,
         });
         continue;
       }
-      const clientAgentId = override?.agentId ?? agentId;
-      if (!clientAgentId) {
-        results.push({
-          target,
-          action: "skip",
-          ok: true,
-          message: `${target.id}: no agent id — skip MCP pin refresh`,
-        });
-        continue;
+      // flair#1834 A1 round 2 (Kern BLOCKING): a VISIT gate. When the entry is
+      // not visible AND its directory is absent, there is nothing to visit —
+      // the primitive cannot resolve the parent and refuses, which the writer
+      // reported as a failure (2-3 such lines on every upgrade for a
+      // Claude-Code-only machine). Skip quietly. EACCES / ELOOP / ENOTDIR (the
+      // directory is present but broken) is NOT absence: fall through so the
+      // refusal stays LOUD.
+      if (!readOwnedPin(target, homeDir).entryExists) {
+        // flair#1834 A1 round 3: lstat does NOT follow a symlink, so a DANGLING
+        // symlink directory is caught here — statSync would follow it and report
+        // ENOENT, quiet-skipping a broken configuration. A genuinely absent
+        // parent (ENOENT on the link itself) stays a quiet skip; EACCES / ELOOP
+        // / ENOTDIR stay loud (fall through to the writer, below).
+        const parent = dirname(target.path);
+        let parentAbsent = false;
+        let dangling = false;
+        try {
+          const st = lstatSync(parent);
+          if (st.isSymbolicLink()) {
+            try { statSync(parent); } catch (err) {
+              if ((err as NodeJS.ErrnoException)?.code === "ENOENT") dangling = true;
+            }
+          }
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException)?.code === "ENOENT") parentAbsent = true;
+        }
+        if (dangling) {
+          results.push({
+            target,
+            action: "skip",
+            ok: false,
+            message: `${target.id}: ${parent} is a dangling symlink (its target does not exist) — refusing to treat a broken configuration as unwired; fix the link`,
+          });
+          continue;
+        }
+        if (parentAbsent) {
+          results.push({ target, action: "skip", ok: true, message: `${target.id}: not wired — skip` });
+          continue;
+        }
       }
       const client = ALL_CLIENTS.find((c) => c.id === target.id);
       if (!client) {
@@ -484,39 +531,37 @@ export function refreshOwnedPins(opts: RefreshOwnedPinsOptions): OwnedPinRefresh
         });
         continue;
       }
-      const env: WireEnv = {
-        FLAIR_AGENT_ID: clientAgentId,
-        FLAIR_URL: override?.flairUrl ?? flairUrl,
-        FLAIR_CLIENT: target.id,
-      };
-      const before = wiringPinString(decodeWiringSpec(readFileText(target.path) ?? "", FLAIR_MCP_PACKAGE));
-      // flair#1778 D4: the wire writes the running CLI's version; never let the
-      // refresh LOWER a pin that is ahead — or rewrite a pin it cannot read.
-      const wouldWritePin = flairCliVersion();
-      if (pinWriteWouldLowerOrIsUnknown(before, wouldWritePin)) {
-        results.push({
-          target,
-          action: "hold",
-          ok: true,
-          message: heldPinMessage(target.id, before as string, wouldWritePin),
-        });
-        continue;
+      // repinJsonMcpPin fails closed on a duplicated key, an ambiguous shape or
+      // a pin the never-lower guard cannot prove safe; it never wires an absent
+      // entry (an absent entry is a clean `skip`).
+      const repin = repinJsonMcpPin(target.path, client.label);
+      switch (repin.kind) {
+        case "repinned":
+          results.push({
+            target,
+            action: "update",
+            ok: true,
+            message:
+              `re-pinned ${client.label} (${repin.oldPin} -> ${repin.newPin})` +
+              (repin.noIdentity ? " — no identity configured" : ""),
+          });
+          break;
+        case "noop":
+          results.push({ target, action: "noop", ok: true, message: repin.line ?? `${client.label}: pin already current` });
+          break;
+        case "skip":
+          results.push({ target, action: "skip", ok: true, message: repin.line ?? `${target.id}: not wired — skip` });
+          break;
+        case "hold":
+          results.push({ target, action: "hold", ok: true, message: `HOLD ${client.label}: ${repin.line}` });
+          break;
+        case "failed":
+          // Failed write stays skip+ok:false (fail-closed, like hook re-pin).
+          // ownedPinRefreshShouldReport treats !ok as printable — do not recode
+          // this as a quiet skip.
+          results.push({ target, action: "skip", ok: false, message: `${client.label}: ${repin.line}` });
+          break;
       }
-      const wired = client.wire(env);
-      const after = wiringPinString(decodeWiringSpec(readFileText(target.path) ?? "", FLAIR_MCP_PACKAGE));
-      // Failed write stays skip+ok:false (fail-closed, like hook re-pin).
-      // ownedPinRefreshShouldReport treats !ok as printable — do not recode
-      // this as a quiet skip.
-      const action =
-        !wired.ok ? "skip"
-          : before !== after ? "update"
-            : "noop";
-      results.push({
-        target,
-        action,
-        ok: wired.ok,
-        message: wired.message,
-      });
     }
     return results;
   });

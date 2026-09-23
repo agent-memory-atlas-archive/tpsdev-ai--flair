@@ -17,7 +17,7 @@ import { buildEd25519Auth, defaultAdminPassPath, defaultKeysDir, resolveAdminUse
 import { flairConfigYamlCandidates, readPortFromYamlFile, resolveFlairConfigYaml } from "../lib/doctor-config-path.js";
 import { collectFederationEnv, describeFederationDriverFinding, federationPeersConfigured, loadYamlDoc } from "../lib/doctor-federation-driver.js";
 import { plistCarriesInlineAdminPassword } from "../lib/launchd-management.js";
-import { DOCTOR_CHECK_IDS, catalogIssueDelta, renderCatalogDoctorLines, runDoctorChecks } from "../lib/doctor-run.js";
+import { DOCTOR_CHECK_IDS, catalogIssueDelta, mcpRepinIcon, renderCatalogDoctorLines, runDoctorChecks } from "../lib/doctor-run.js";
 import { describeEmbedGpuDoctorFinding } from "../lib/embed-gpu-doctor.js";
 import { adminPassDesyncFinding, detectPersistedAdminUser } from "../lib/init-admin-pass.js";
 import { opsApiBindFinding } from "../lib/ops-api-bind.js";
@@ -1018,7 +1018,11 @@ program
       if (autoFix) {
         const behindMcp = mcpClientPinFindings(homedir(), flairCliVersion())
           .filter((f) => f.direction === "behind")
-          .filter((f) => readClientMcpBlock(f.reading.target.id as ClientId, homedir()).present);
+          // flair#1834 A1: key off STRUCTURAL presence (entryExists), not
+          // `present` (= agent id set). A behind entry without an identity is
+          // still a pin we own and re-pin — the pin-only writer preserves
+          // whatever identity the entry carries.
+          .filter((f) => f.reading.entryExists);
         if (behindMcp.length > 0) {
           if (dryRun) {
             for (const f of behindMcp) {
@@ -1027,18 +1031,14 @@ program
           } else {
             const overrides = behindMcp.map((f) => {
               const id = f.reading.target.id as ClientId;
-              const block = readClientMcpBlock(id, homedir());
-              return { kind: "mcp-client" as const, id, agentId: block.agentId ?? null, flairUrl: effectiveFlairUrl(block).url };
+              return { kind: "mcp-client" as const, id };
             });
             const results = refreshOwnedPins({ homeDir: homedir(), targets: overrides });
             for (const r of results) {
               if (r.target.kind !== "mcp-client") continue;
-              if (r.action === "update") {
-                const old = behindMcp.find((f) => f.reading.target.id === r.target.id)?.reading.pin;
-                console.log(`     ${render.icons.ok} re-pinned the MCP server block in ${render.wrap(render.c.dim, r.target.path)} (${FLAIR_MCP_PACKAGE}@${old} -> ${mcpServerSpec()})`);
-              } else {
-                console.log(`     ${r.ok ? render.icons.ok : render.icons.warn} ${r.message}`);
-              }
+              // flair#1834 round 3: an attempted-but-skipped fix (e.g. a behind
+              // Codex pin until A2 lands) is not a success — never ✓.
+              console.log(`     ${render.icons[mcpRepinIcon(r.action, r.ok)]} ${r.message}`);
             }
           }
         }
