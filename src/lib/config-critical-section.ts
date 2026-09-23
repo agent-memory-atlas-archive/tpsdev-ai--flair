@@ -182,12 +182,18 @@ export interface ConfigSectionOptions {
    *  Inert unless a fixture sets them. `afterPreObserve` fires between the
    *  pre-lock observation and the lock; `afterRead` fires between the in-lock
    *  read and `decide`; `afterTempCreate` fires right after the staging file is
-   *  created and before any bytes are written. Child-process fixtures use the
-   *  `FLAIR_TEST_CRITICAL_BARRIER` env directory instead (see `envBarrier`). */
+   *  created and before any bytes are written; `afterFsync` fires after the
+   *  staging file is fsynced and before the rename (the crash window).
+   *  Child-process fixtures use the `FLAIR_TEST_CRITICAL_BARRIER` env
+   *  directory instead (see `envBarrier`). NOTE: that env path assumes a
+   *  TRUSTED environment — anyone who can set a flair process's environment can
+   *  already set HOME / FLAIR_*, so it grants no capability it did not already
+   *  have, and it is self-releasing (a barrier waits at most 15 s). */
   testHooks?: {
     afterPreObserve?: (attempt: number) => void;
     afterRead?: (attempt: number) => void;
     afterTempCreate?: (tempPath: string) => void;
+    afterFsync?: (tempPath: string) => void;
   };
 }
 
@@ -226,14 +232,24 @@ function sleepSync(ms: number): void {
 
 /** ENV-GATED barrier for child-process fixtures: after marking its own stage
  *  file it waits (bounded) for a `go` file the schedule controller drops.
- *  Inert unless `FLAIR_TEST_CRITICAL_BARRIER` names a directory. */
+ *  Inert unless `FLAIR_TEST_CRITICAL_BARRIER` names a directory.
+ *
+ *  TRUSTED-ENV ASSUMPTION: this path is only as privileged as the environment
+ *  it is set in. Anyone who can set a flair process's `FLAIR_TEST_CRITICAL_BARRIER`
+ *  can already set `HOME` / `FLAIR_*`, so the barrier grants no capability that
+ *  was not already available to them; and it self-releases — a stale barrier
+ *  waits at most 15 s, then proceeds. */
 function envBarrier(stage: string): void {
   const dir = process.env.FLAIR_TEST_CRITICAL_BARRIER;
   if (!dir) return;
   try { writeFileSync(join(dir, `${process.pid}.${stage}`), "1"); } catch { /* */ }
   const go = join(dir, "go");
+  // A STAGE-SPECIFIC release (`go.<stage>`) lets a fixture advance the earlier
+  // stages while HOLDING this one — the shared `go` releases every stage at
+  // once (flair#1778 2c-i-d2 needs the writer to pause at the fsync stage).
+  const goStage = join(dir, `go.${stage}`);
   const deadline = Date.now() + 15_000;
-  while (!existsSync(go) && Date.now() < deadline) sleepSync(5);
+  while (!existsSync(go) && !existsSync(goStage) && Date.now() < deadline) sleepSync(5);
 }
 
 function barrier(hook: ((attempt: number) => void) | undefined, stage: string, attempt: number): void {
@@ -468,6 +484,10 @@ export function atomicReplace(
   bytes: Uint8Array,
   original: { mode: number; uid: number; gid: number } | null,
   onTempCreate?: (tempPath: string) => void,
+  // TEST-ONLY: fires AFTER the staging file is fsynced and BEFORE the rename
+  // (flair#1778 2c-i-d2 crash window, T1c). A SIGKILL here leaves the target
+  // byte-identical and orphans the temp + lock (cleanup bypassed).
+  onAfterFsync?: (tempPath: string) => void,
 ): ReplaceResult {
   if (original && !isRegularMode(original.mode)) {
     return { ok: false, reason: `the destination ${targetPath} is not a regular file (mode ${original.mode.toString(8)}); refusing to replace it` };
@@ -516,6 +536,13 @@ export function atomicReplace(
   } finally {
     if (fd >= 0) { try { closeSync(fd); } catch { /* */ } }
   }
+
+  // TEST-ONLY barrier AFTER the fsync (and the fd close) and BEFORE the rename
+  // (flair#1778 2c-i-d2, T1c). Inert in production: envBarrier returns unless
+  // FLAIR_TEST_CRITICAL_BARRIER is set. A SIGKILL here leaves the target
+  // byte-identical and orphans the staging temp + the lock (the crash window).
+  envBarrier("fsync");
+  onAfterFsync?.(tempPath);
 
   try { renameSync(tempPath, targetPath); }
   catch (err) { cleanupTemp(); return { ok: false, reason: `could not rename the staging file into place: ${msg(err)}` }; }
@@ -624,7 +651,7 @@ export function withConfigCriticalSection(
       const original = obs.target.type === "regular"
         ? { mode: obs.target.mode!, uid: obs.target.uid!, gid: obs.target.gid! }
         : null;
-      const wr = atomicReplace(targetPath, decision.write, original, opts.testHooks?.afterTempCreate);
+      const wr = atomicReplace(targetPath, decision.write, original, opts.testHooks?.afterTempCreate, opts.testHooks?.afterFsync);
       if (!wr.ok) {
         return { status: "refused", path: targetPath, attempts, message: `nothing written: ${wr.reason}`, backupPath };
       }
