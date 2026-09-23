@@ -878,7 +878,18 @@ program
       agentFlag: typeof opts.agent === "string" ? opts.agent : undefined,
     };
     const catalogBefore = runDoctorChecks(doctorCtx, { catalogIds: doctorCatalogIds });
-    if (detectedClients.length === 0) {
+    // flair#1834 PR-H: a hook file on disk IS the wiring — the same rule the
+    // hook arms below apply. A SessionStart hook wired in ~/.claude/settings.json
+    // (or ~/.codex/hooks.json) is a Flair client integration even when the MCP
+    // server is configured PROJECT-scoped (a project's .mcp.json) rather than in
+    // ~/.claude.json — and even when the harness binary is not on this shell's
+    // PATH. Without this the whole section was skipped outright ("No MCP client
+    // detected") and a HOLD on that wired hook was silently missed. Presence-only
+    // here (probe:false); the arms below run the bounded execution probe.
+    const anyWiredSessionStartHook =
+      inspectSessionStartHook(homedir(), { settingsPath: hookSettingsPath(homedir(), "claude-code"), probe: false }).present ||
+      inspectSessionStartHook(homedir(), { settingsPath: hookSettingsPath(homedir(), "codex"), probe: false }).present;
+    if (detectedClients.length === 0 && !anyWiredSessionStartHook) {
       console.log(`  ${render.icons.info} No MCP client detected — skipping client-integration checks`);
     } else {
       let claudeCodeAgentId: string | undefined;
@@ -1111,7 +1122,20 @@ program
             console.log(`     ${render.wrap(render.c.dim, "Fix:")} flair doctor --fix ${render.wrap(render.c.dim, "(adds the mcp__flair__bootstrap line to ./CLAUDE.md)")}`);
           }
         }
+      } // end CLAUDE.md (claudeCodeConfigured)
 
+      // flair#1834 PR-H: a hook file on disk IS the wiring — the same rule as
+      // the Codex hook below. A realistic setup keeps the SessionStart hook in
+      // ~/.claude/settings.json while the flair MCP server is configured
+      // PROJECT-scoped (a project's .mcp.json) rather than in ~/.claude.json.
+      // claudeCodeConfigured is then false and the hook never ran — a silently
+      // skipped HOLD, the exact state PR-H exists to prevent. Inspect the
+      // Claude Code hook whenever one is PRESENT on disk; a
+      // `claudeCodeConfigured` box with NO hook still falls through to the
+      // "not found / add" report below.
+      const claudeHook = inspectSessionStartHook(homedir(), { settingsPath: hookSettingsPath(homedir(), "claude-code") });
+      if (claudeCodeConfigured || claudeHook.present) {
+        const hook = claudeHook;
         // flair#1007: presence was never the problem — the failing entry was
         // perfectly well-formed. inspectSessionStartHook() additionally RUNS
         // the registered command (bounded, side-effect-free via
@@ -1119,7 +1143,6 @@ program
         // works", and reports the shell-level silencing separately so an
         // already-installed loud hook can be upgraded rather than only
         // diagnosed.
-        const hook = inspectSessionStartHook(homedir());
         if (hook.present) {
           // flair#1485: pin ≠ installed CLI version is a failure, never a
           // ✓ "still runs". Check freshness first so a stale pin cannot
@@ -1142,7 +1165,10 @@ program
                 console.log(`     ${render.wrap(render.c.dim, "Would re-pin the SessionStart hook in")} ${hook.path}`);
               } else {
                 const repin = repinSessionStartHookGuarded(homedir(), "claude-code");
-                console.log(`     ${repin.ok ? render.icons.ok : render.icons.warn} ${repin.message}`);
+                // flair#1834 A1 round 3 + PR-H: the SAME icon rule as the MCP
+                // re-pin line — a hold (or a failed write) renders ⚠, never a
+                // false ✓ for an attempted-but-held fix.
+                console.log(`     ${render.icons[mcpRepinIcon(repin.action, repin.ok)]} ${repin.message}`);
               }
             } else {
               console.log(`     ${render.wrap(render.c.dim, "Fix:")} flair hook install ${render.wrap(render.c.dim, "(re-pins the hook to the installed CLI version)")}`);
@@ -1228,7 +1254,7 @@ program
             console.log(`     ${render.wrap(render.c.dim, "Fix:")} flair doctor --fix ${render.wrap(render.c.dim, "(adds the flair-session-start SessionStart hook)")}`);
           }
         }
-      } // end CLAUDE.md + SessionStart hook (claudeCodeConfigured)
+      } // end SessionStart hook (claudeCodeConfigured || hook.present)
 
       // Continuity capture is a standalone Claude Code opt-in — shown whenever
       // Claude Code is DETECTED, independent of MCP wiring (flair#1324/#1257).
@@ -1285,8 +1311,17 @@ program
       // command Claude Code uses, written to ~/.codex/hooks.json. Continuity
       // and CLAUDE.md stay Claude-Code-only; Codex's session-start mechanism
       // is the hook file.
-      if (codexConfigured) {
-        const hook = inspectSessionStartHook(homedir(), { settingsPath: hookSettingsPath(homedir(), "codex") });
+      // flair#1834 PR-H: a hook file on disk IS the wiring. Inspect Codex's
+      // SessionStart hook whenever one is PRESENT on disk, not only when Codex
+      // is otherwise detected/configured on this box (a `codex` binary on PATH
+      // or a wired ~/.codex/config.toml). Gating the whole block on Codex's MCP
+      // configuration silently skipped a wired ~/.codex/hooks.json when Codex
+      // was not installed — exactly the quiet skip PR-H exists to prevent (a
+      // HOLD must be printed). A `codexConfigured` box with NO hook still falls
+      // through to the "not found / add" report below.
+      const codexHook = inspectSessionStartHook(homedir(), { settingsPath: hookSettingsPath(homedir(), "codex") });
+      if (codexConfigured || codexHook.present) {
+        const hook = codexHook;
         if (hook.present) {
           const codexStale = sessionStartHookPinFindings(homedir()).find((f) => f.reading.target.id === "codex");
           if (codexStale && codexStale.direction === "unknown") {
@@ -1302,7 +1337,10 @@ program
                 console.log(`     ${render.wrap(render.c.dim, "Would re-pin the SessionStart hook in")} ${hook.path}`);
               } else {
                 const repin = repinSessionStartHookGuarded(homedir(), "codex");
-                console.log(`     ${repin.ok ? render.icons.ok : render.icons.warn} ${repin.message}`);
+                // flair#1834 A1 round 3 + PR-H: the SAME icon rule as the MCP
+                // re-pin line — a hold (or a failed write) renders ⚠, never a
+                // false ✓ for an attempted-but-held fix.
+                console.log(`     ${render.icons[mcpRepinIcon(repin.action, repin.ok)]} ${repin.message}`);
               }
             } else {
               console.log(`     ${render.wrap(render.c.dim, "Fix:")} flair hook install --harness codex ${render.wrap(render.c.dim, "(re-pins the hook to the installed CLI version)")}`);
