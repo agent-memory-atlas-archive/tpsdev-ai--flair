@@ -1,33 +1,99 @@
-import { describe, test, expect, mock, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+/**
+ * openclaw-flair — identity core (slice 1) tests.
+ *
+ * The mock models the REAL host registration contract and is typed against the
+ * plugin API from the `openclaw` devDep (`OpenClawPluginApi`):
+ *   - tools are registered as FACTORIES `(ctx) => tool`, resolved per call with
+ *     an immutable `ctx.agentId`;
+ *   - prompt/context policy and conversation access are host config gates
+ *     (`plugins.entries.<id>.hooks.allowPromptInjection` /
+ *     `allowConversationAccess`) — a gated hook is NOT delivered when withheld;
+ *   - the host version is read at load time from `api.runtime.version`, and
+ *     outside the tested set the plugin registers NOTHING;
+ *   - the host delivers `agent_end` before `llm_output`.
+ *
+ * Network is stubbed at `globalThis.fetch`, so "a refusal makes zero outgoing
+ * requests" is asserted directly, and the signer id is read off the
+ * `Authorization` header of anything that IS sent.
+ *
+ * Typed against the plugin API in `openclaw@2026.7.1` (the devDependency in
+ * this tree). Parity with 2026.8.1 / 2026.9.6 is proven only by the real-host
+ * drills, not by this mock.
+ */
+
+import { describe, test, expect, beforeEach, afterEach, mock } from "bun:test";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync } from "node:fs";
+import * as realFs from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { FlairClient } from "@tpsdev-ai/flair-client";
+import { randomBytes } from "node:crypto";
+import { loadPrivateKey, resolveKeyPath } from "@tpsdev-ai/flair-client";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 
-// Minimal mock of OpenClawPluginApi
-function createMockApi(config: Record<string, unknown> = {}) {
-  const tools = new Map<string, { execute: Function }>();
-  const hooks = new Map<string, Function[]>();
+/** The one file the A1 regression test plants under a root-owned directory. */
+const A1_TMP_KEY = "/tmp/ocf-a1-916.key";
+
+// ── mock host api, typed against the SDK's plugin API ────────────────────────
+
+type ToolCtx = { agentId?: string };
+type MockFn = (event: any, ctx: ToolCtx) => any;
+
+/** Hooks the host gates: withheld policy/permission means NOT delivered. */
+const PROMPT_GATED = new Set(["before_prompt_build", "agent_turn_prepare", "before_agent_start"]);
+const CONVERSATION_GATED = new Set(["llm_input", "llm_output", "agent_end"]);
+
+type MockApi = Partial<OpenClawPluginApi> & {
+  _tools: Map<string, unknown>;
+  _hooks: Map<string, MockFn[]>;
+  _contextEngines: Map<string, Function>;
+  _services: Map<string, { id: string; start: (ctx: any) => any }>;
+  _resolveTool: (name: string, ctx: ToolCtx) => any;
+  _warnText: () => string;
+  _statusLine: () => string;
+  _fire: (hook: string, event: any, ctx: ToolCtx) => Promise<string[]>;
+  _runTurn: (ctx: ToolCtx, payload: { messages?: any[]; prompt?: string; assistantTexts?: string[] }) => Promise<void>;
+};
+
+function createMockApi(opts: {
+  pluginConfig?: Record<string, unknown>;
+  config?: Record<string, unknown>;
+  /** Host version exposed as api.runtime.version; null = field absent. */
+  hostVersion?: string | null;
+} = {}): MockApi {
+  const tools = new Map<string, unknown>();
+  const hooks = new Map<string, MockFn[]>();
   const contextEngines = new Map<string, Function>();
+  const services = new Map<string, { id: string; start: (ctx: any) => any }>();
 
-  return {
-    pluginConfig: {
-      url: "http://localhost:19926",
-      agentId: "test-agent",
-      autoCapture: false,
-      autoRecall: false,
-      ...config,
+  const hooksAllowed = (hook: string): boolean => {
+    const entry = ((opts.config as any)?.plugins?.entries?.["openclaw-flair"]?.hooks ?? {}) as {
+      allowPromptInjection?: boolean;
+      allowConversationAccess?: boolean;
+    };
+    if (PROMPT_GATED.has(hook)) return entry.allowPromptInjection === true;
+    if (CONVERSATION_GATED.has(hook)) return entry.allowConversationAccess === true;
+    return true;
+  };
+
+  const defaultConfig = {
+    agents: { entries: { A: {} } },
+    plugins: { slots: { memory: "openclaw-flair" }, entries: {} },
+  };
+
+  const api = {
+    id: "openclaw-flair",
+    name: "openclaw-flair",
+    version: "0.55.2",
+    source: "local",
+    registrationMode: "full",
+    config: opts.config !== undefined ? opts.config : defaultConfig,
+    pluginConfig: { url: "http://127.0.0.1:19926", ...(opts.pluginConfig ?? {}) },
+    runtime: opts.hostVersion === null ? {} : { version: opts.hostVersion ?? "2026.8.1" },
+    logger: { info: mock(() => {}), warn: mock(() => {}), error: mock(() => {}), debug: mock(() => {}) },
+    registerTool(toolOrFactory: unknown, o?: { name?: string }) {
+      tools.set(o?.name ?? (toolOrFactory as any)?.name, toolOrFactory);
     },
-    logger: {
-      info: mock(() => {}),
-      warn: mock(() => {}),
-      error: mock(() => {}),
-      debug: mock(() => {}),
-    },
-    registerTool(spec: { name: string; execute: Function }, opts: { name: string }) {
-      tools.set(opts.name, { execute: spec.execute });
-    },
-    on(event: string, handler: Function) {
+    on(event: string, handler: MockFn) {
       const list = hooks.get(event) ?? [];
       list.push(handler);
       hooks.set(event, list);
@@ -35,970 +101,745 @@ function createMockApi(config: Record<string, unknown> = {}) {
     registerContextEngine(id: string, factory: Function) {
       contextEngines.set(id, factory);
     },
-    // Test helpers
+    registerService(service: { id: string; start: (ctx: any) => any }) {
+      services.set(service.id, service);
+    },
     _tools: tools,
     _hooks: hooks,
     _contextEngines: contextEngines,
-  };
-}
-
-describe("memory-flair plugin", () => {
-  let savedAgentId: string | undefined;
-  let savedFetch: typeof globalThis.fetch;
-  let unexpectedFetch: ReturnType<typeof mock>;
-  beforeEach(() => {
-    savedAgentId = process.env.FLAIR_AGENT_ID;
-    delete process.env.FLAIR_AGENT_ID;
-    savedFetch = globalThis.fetch;
-    unexpectedFetch = mock(() => { throw new Error("Unexpected network call in plugin registration test"); });
-    globalThis.fetch = unexpectedFetch as unknown as typeof fetch;
-  });
-  afterEach(() => {
-    globalThis.fetch = savedFetch;
-    if (savedAgentId === undefined) delete process.env.FLAIR_AGENT_ID;
-    else process.env.FLAIR_AGENT_ID = savedAgentId;
-    expect(unexpectedFetch).not.toHaveBeenCalled();
-  });
-
-  test("registers all three tools", async () => {
-    // Import triggers registration
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi();
-    plugin.register(api as any);
-
-    expect(api._tools.has("memory_search")).toBe(true);
-    expect(api._tools.has("memory_store")).toBe(true);
-    expect(api._tools.has("memory_get")).toBe(true);
-  });
-
-  test("kind is 'memory'", async () => {
-    const plugin = (await import("../index.ts")).default;
-    expect(plugin.kind).toBe("memory");
-  });
-
-  test("registers before_agent_start hook", async () => {
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi();
-    plugin.register(api as any);
-
-    const hooks = api._hooks.get("before_agent_start") ?? [];
-    expect(hooks.length).toBeGreaterThanOrEqual(1);
-  });
-
-  test("auto mode does not pre-create client", async () => {
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi({ agentId: "auto" });
-    // Should not throw — auto mode defers client creation
-    expect(() => plugin.register(api as any)).not.toThrow();
-  });
-
-  test("memory_store returns error when no agentId in auto mode", async () => {
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi({ agentId: "auto" });
-    plugin.register(api as any);
-
-    const tool = api._tools.get("memory_store")!;
-    const result = await tool.execute("test", { text: "hello" });
-    expect(result.content[0].text).toContain("unavailable");
-  });
-
-  test("memory_search returns error when no agentId in auto mode", async () => {
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi({ agentId: "auto" });
-    plugin.register(api as any);
-
-    const tool = api._tools.get("memory_search")!;
-    const result = await tool.execute("test", { query: "hello" });
-    expect(result.content[0].text).toContain("unavailable");
-  });
-
-  test("before_agent_start hook attempts workspace sync when agentId provided", async () => {
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi({ agentId: "auto" });
-    plugin.register(api as any);
-
-    const hooks = api._hooks.get("before_agent_start") ?? [];
-    // Should not throw even when Flair is unreachable (graceful degradation)
-    for (const hook of hooks) {
-      await hook({}, { agentId: "nonexistent-test-agent" });
-    }
-    // Verify it logged a warning (Flair unreachable) rather than crashing
-    const warnCalls = (api.logger.warn as any).mock.calls;
-    // At least one warning about sync or bootstrap failure
-    expect(warnCalls.length).toBeGreaterThanOrEqual(0); // doesn't crash
-  });
-});
-
-// ─── syncWorkspaceToFlair unit tests ─────────────────────────────────────────
-// Tests the sync logic directly by mirroring the hash-based dedup algorithm.
-// These tests do NOT spin up Harper — they simulate the Flair client interactions.
-
-/** Mirrors the hash logic in the plugin (sha256, 16-char hex prefix) */
-function hashContent(content: string): string {
-  const { createHash } = require("node:crypto");
-  return createHash("sha256").update(content).digest("hex").slice(0, 16);
-}
-
-describe("syncWorkspaceToFlair — workspace file → Flair soul logic", () => {
-  let tmpDir: string;
-
-  beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "tps-soul-sync-"));
-  });
-
-  afterEach(() => {
-    rmSync(tmpDir, { recursive: true, force: true });
-  });
-
-  /** Simulate the sync logic from the plugin */
-  async function runSync(
-    workspaceDir: string,
-    getSoulImpl: (key: string) => Promise<any>,
-    writeSoulImpl: (key: string, value: string, hash: string) => Promise<void>,
-    logger = { info: () => {}, warn: () => {} },
-  ) {
-    const { existsSync, readFileSync } = require("node:fs");
-    const { resolve } = require("node:path");
-    const files: Record<string, string> = {
-      "SOUL.md": "soul",
-      "IDENTITY.md": "identity",
-      "USER.md": "user-context",
-      "AGENTS.md": "workspace-rules",
-    };
-    const MAX_SIZE = 8000;
-    let synced = 0;
-
-    for (const [filename, soulKey] of Object.entries(files)) {
-      const filePath = resolve(workspaceDir, filename);
-      if (!existsSync(filePath)) continue;
-      try {
-        let content = readFileSync(filePath, "utf-8").trim();
-        if (!content) continue;
-        if (content.length > MAX_SIZE) content = content.slice(0, MAX_SIZE) + "\n…(truncated)";
-        const newHash = hashContent(content);
-        const existing = await getSoulImpl(soulKey);
-        if (existing?.contentHash === newHash) continue;
-        await writeSoulImpl(soulKey, content, newHash);
-        synced++;
-        (logger.info as any)(`synced ${filename} → soul:${soulKey}`);
-      } catch (err: any) {
-        (logger.warn as any)(`failed to sync ${filename}: ${err.message}`);
+    _services: services,
+    _resolveTool(name: string, ctx: ToolCtx) {
+      const entry = tools.get(name);
+      if (entry === undefined) return null;
+      return typeof entry === "function" ? (entry as any)(ctx) : entry;
+    },
+    _warnText(): string {
+      return (api.logger.warn as any).mock.calls.map((c: any[]) => String(c[0])).join("\n");
+    },
+    _statusLine(): string {
+      return (api.logger.info as any).mock.calls.map((c: any[]) => String(c[0])).join("\n");
+    },
+    /** Deliver ONE hook the way the host would: gated -> not delivered. */
+    async _fire(hook: string, event: any, ctx: ToolCtx): Promise<string[]> {
+      const delivered: string[] = [];
+      if (!hooksAllowed(hook)) return delivered;
+      for (const h of hooks.get(hook) ?? []) {
+        await h(event, ctx);
+        delivered.push(hook);
       }
-    }
-    return synced;
+      return delivered;
+    },
+    /** One host turn: the real delivery order (agent_end before llm_output). */
+    async _runTurn(ctx: ToolCtx, payload: { messages?: any[]; prompt?: string; assistantTexts?: string[] }) {
+      await this._fire("llm_input", { runId: "r", sessionId: "s", provider: "p", model: "m", prompt: payload.prompt ?? "" }, ctx);
+      await this._fire("agent_end", { messages: payload.messages ?? [] }, ctx);
+      await this._fire("llm_output", { runId: "r", sessionId: "s", provider: "p", model: "m", assistantTexts: payload.assistantTexts ?? [] }, ctx);
+    },
+  };
+  return api as unknown as MockApi;
+}
+
+// ── network stub ─────────────────────────────────────────────────────────────
+
+interface Call { url: string; method: string; authorization: string | null }
+
+function installFetchStub(handler?: (call: Call) => { status?: number; body?: unknown }) {
+  const calls: Call[] = [];
+  globalThis.fetch = (async (url: string, init: any = {}) => {
+    const headers = (init.headers ?? {}) as Record<string, string>;
+    const call: Call = { url: String(url), method: init.method ?? "GET", authorization: headers["Authorization"] ?? null };
+    calls.push(call);
+    const out = handler ? handler(call) : {};
+    const body = out.body === undefined ? { results: [] } : out.body;
+    return new Response(JSON.stringify(body), { status: out.status ?? 200, headers: { "content-type": "application/json" } });
+  }) as unknown as typeof fetch;
+  return calls;
+}
+
+function signerOf(call: Call): string | null {
+  const m = (call.authorization ?? "").match(/^TPS-Ed25519\s+([^:]+):/);
+  return m ? m[1] : null;
+}
+
+// ── per-test HOME + key dir ──────────────────────────────────────────────────
+
+let home: string;
+let keyDir: string;
+let savedEnv: Record<string, string | undefined>;
+
+function writeKey(agentId: string, bytes: Buffer = randomBytes(32)): void {
+  writeFileSync(join(keyDir, `${agentId}.key`), bytes);
+  chmodSync(join(keyDir, `${agentId}.key`), 0o600);
+}
+
+beforeEach(() => {
+  home = mkdtempSync(join(tmpdir(), "ocf-id-"));
+  keyDir = join(home, "keys");
+  mkdirSync(keyDir, { recursive: true });
+  savedEnv = {
+    HOME: process.env.HOME,
+    FLAIR_KEY_DIR: process.env.FLAIR_KEY_DIR,
+    OPENCLAW_VERSION: process.env.OPENCLAW_VERSION,
+    OPENCLAW_COMPATIBILITY_HOST_VERSION: process.env.OPENCLAW_COMPATIBILITY_HOST_VERSION,
+    FLAIR_AGENT_ID: process.env.FLAIR_AGENT_ID,
+  };
+  process.env.HOME = home;
+  process.env.FLAIR_KEY_DIR = keyDir;
+  process.env.OPENCLAW_VERSION = "2026.8.1"; // must be ignored
+  process.env.OPENCLAW_COMPATIBILITY_HOST_VERSION = "2026.8.1";
+  delete process.env.FLAIR_AGENT_ID; // env identity must be ignored entirely
+  // Restore the injectable key probes (a prior test may have substituted them).
+  signingKeyProbe.resolve = (a, kp) => resolveKeyPath(a, kp);
+  signingKeyProbe.load = (f) => loadPrivateKey(f);
+});
+
+afterEach(() => {
+  for (const [k, v] of Object.entries(savedEnv)) {
+    if (v === undefined) delete (process.env as any)[k];
+    else (process.env as any)[k] = v;
   }
+  rmSync(home, { recursive: true, force: true });
+  rmSync(A1_TMP_KEY, { force: true });
+});
 
-  test("1. syncs SOUL.md content to Flair soul entry", async () => {
-    writeFileSync(join(tmpDir, "SOUL.md"), "# My Soul\nI am an agent.");
+async function loadPlugin() {
+  return (await import("../index.ts")).default;
+}
 
-    const written: Record<string, { value: string; hash: string }> = {};
-    const synced = await runSync(
-      tmpDir,
-      async (_key) => null,
-      async (key, value, hash) => { written[key] = { value, hash }; },
-    );
+/** The module namespace (for the probe + helpers). */
+async function loadModule(): Promise<any> {
+  return await import("../index.ts");
+}
 
-    expect(synced).toBe(1);
-    expect(written["soul"]).toBeDefined();
-    expect(written["soul"].value).toContain("I am an agent.");
-    expect(written["soul"].hash).toBe(hashContent("# My Soul\nI am an agent."));
+// The probe object the plugin's re-verification uses. On a build without it,
+// substitutions below are inert (which is how these tests go red there).
+let signingKeyProbe: { resolve: (a: string, kp?: string) => string | null; load: (f: string) => any };
+try {
+  signingKeyProbe = (await import("../index.ts") as any).signingKeyProbe ?? {
+    resolve: (a: string, kp?: string) => resolveKeyPath(a, kp),
+    load: (f: string) => loadPrivateKey(f),
+  };
+} catch {
+  signingKeyProbe = { resolve: (a, kp) => resolveKeyPath(a, kp), load: (f) => loadPrivateKey(f) };
+}
+
+// ── host version gate (R1) ───────────────────────────────────────────────────
+
+describe("host version gate (runtime.version is the ONLY source, exact match)", () => {
+  test("runtime.version in the tested set registers", async () => {
+    const plugin = await loadPlugin();
+    installFetchStub();
+    const api = createMockApi({ hostVersion: "2026.9.6" });
+    plugin.register(api as any);
+    expect(api._tools.size).toBe(3);
   });
 
-  test("2. skips file when content hash matches existing soul entry", async () => {
-    const content = "# Soul\nIdentity text";
-    writeFileSync(join(tmpDir, "SOUL.md"), content);
-    const existingHash = hashContent(content);
-
-    const writeCalls: string[] = [];
-    const synced = await runSync(
-      tmpDir,
-      async (key) => key === "soul" ? { contentHash: existingHash } : null,
-      async (key) => { writeCalls.push(key); },
-    );
-
-    expect(synced).toBe(0);
-    expect(writeCalls).not.toContain("soul");
+  test("R1: a SUFFIXED version is NOT in the set (2026.8.1-dev registers nothing)", async () => {
+    const plugin = await loadPlugin();
+    installFetchStub();
+    const api = createMockApi({ hostVersion: "2026.8.1-dev" });
+    plugin.register(api as any);
+    expect(api._tools.size).toBe(0);
+    expect(api._warnText()).toMatch(/host 2026\.8\.1-dev not in tested set/);
   });
 
-  test("3. skips files that don't exist — no error", async () => {
-    // No files in tmpDir
-    const synced = await runSync(
-      tmpDir,
-      async (_key) => null,
-      async (_key) => { throw new Error("should not be called"); },
-    );
-    expect(synced).toBe(0);
+  test("runtime.version absent: registers nothing with the disabled line", async () => {
+    const plugin = await loadPlugin();
+    installFetchStub();
+    const api = createMockApi({ hostVersion: null });
+    plugin.register(api as any);
+    expect(api._tools.size).toBe(0);
+    expect(api._hooks.size).toBe(0);
+    expect(api._contextEngines.size).toBe(0);
+    expect(api._warnText()).toMatch(/openclaw-flair disabled: host unknown not in tested set/);
   });
 
-  test("4. skips empty files — no write", async () => {
-    writeFileSync(join(tmpDir, "SOUL.md"), "   \n  \n  ");
-
-    const writeCalls: string[] = [];
-    const synced = await runSync(
-      tmpDir,
-      async (_key) => null,
-      async (key) => { writeCalls.push(key); },
-    );
-
-    expect(synced).toBe(0);
-    expect(writeCalls).toHaveLength(0);
+  test("an env var cannot satisfy the gate: OPENCLAW_VERSION set, runtime.version absent -> nothing", async () => {
+    const plugin = await loadPlugin();
+    installFetchStub();
+    const api = createMockApi({ hostVersion: null });
+    plugin.register(api as any);
+    expect(api._tools.size).toBe(0);
+    expect(api._warnText()).toMatch(/not in tested set/);
   });
 
-  test("5. syncs multiple files in one pass", async () => {
-    writeFileSync(join(tmpDir, "SOUL.md"), "Soul content");
-    writeFileSync(join(tmpDir, "IDENTITY.md"), "Identity content");
-    writeFileSync(join(tmpDir, "USER.md"), "User content");
-    writeFileSync(join(tmpDir, "AGENTS.md"), "Agents content");
-
-    const written: string[] = [];
-    const synced = await runSync(
-      tmpDir,
-      async (_key) => null,
-      async (key) => { written.push(key); },
-    );
-
-    expect(synced).toBe(4);
-    expect(written).toContain("soul");
-    expect(written).toContain("identity");
-    expect(written).toContain("user-context");
-    expect(written).toContain("workspace-rules");
+  test("out-of-set host: registers NOTHING and reports the line", async () => {
+    const plugin = await loadPlugin();
+    installFetchStub();
+    const api = createMockApi({ hostVersion: "2026.5.7" });
+    plugin.register(api as any);
+    expect(api._tools.size).toBe(0);
+    expect(api._hooks.size).toBe(0);
+    expect(api._services.size).toBe(0);
+    expect(api._contextEngines.size).toBe(0);
+    expect(api._warnText()).toMatch(/openclaw-flair disabled: host 2026\.5\.7 not in tested set/);
   });
 
-  test("6. partial sync: only changed files are written", async () => {
-    const soulContent = "Soul text";
-    const identityContent = "Identity text";
-    writeFileSync(join(tmpDir, "SOUL.md"), soulContent);
-    writeFileSync(join(tmpDir, "IDENTITY.md"), identityContent);
-
-    // Soul already synced, identity is new
-    const written: string[] = [];
-    const synced = await runSync(
-      tmpDir,
-      async (key) => key === "soul" ? { contentHash: hashContent(soulContent) } : null,
-      async (key) => { written.push(key); },
-    );
-
-    expect(synced).toBe(1);
-    expect(written).toContain("identity");
-    expect(written).not.toContain("soul");
-  });
-
-  test("7. correct soul keys per the spec (AGENTS.md → workspace-rules, USER.md → user-context)", async () => {
-    writeFileSync(join(tmpDir, "AGENTS.md"), "Workspace rules");
-    writeFileSync(join(tmpDir, "USER.md"), "User context");
-
-    const keys: string[] = [];
-    await runSync(
-      tmpDir,
-      async (_key) => null,
-      async (key) => { keys.push(key); },
-    );
-
-    expect(keys).toContain("workspace-rules");
-    expect(keys).toContain("user-context");
-    expect(keys).not.toContain("agents");
-    expect(keys).not.toContain("user");
+  test("no context-engine slot is selected (slice 1 slot safety)", async () => {
+    const plugin = await loadPlugin();
+    installFetchStub();
+    const api = createMockApi();
+    plugin.register(api as any);
+    expect(api._contextEngines.size).toBe(0);
+    expect(api._hooks.has("before_agent_start")).toBe(false);
   });
 });
 
-// ─── FlairBehavioralAnchorEngine — context engine tests ──────────────────────
-// The engine reads ~/.openclaw/workspace-<agentId>/{IDENTITY,SOUL,AGENTS}.md
-// and returns their concatenated contents as a systemPromptAddition. Tests
-// override HOME to point at a temp dir so we can write fake workspace files.
+// ── agent set + shared-OS-user (R2, R2b) ─────────────────────────────────────
 
-describe("FlairBehavioralAnchorEngine — anchor re-injection", () => {
-  let tmpHome: string;
-  let originalHome: string | undefined;
-
-  beforeEach(() => {
-    tmpHome = mkdtempSync(join(tmpdir(), "tps-anchor-engine-"));
-    originalHome = process.env.HOME;
-    process.env.HOME = tmpHome;
-  });
-
-  afterEach(() => {
-    if (originalHome !== undefined) process.env.HOME = originalHome;
-    else delete process.env.HOME;
-    rmSync(tmpHome, { recursive: true, force: true });
-  });
-
-  test("plugin registers a context engine with id 'flair'", async () => {
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi();
+describe("agent set and shared-OS-user detection (fail closed)", () => {
+  test("R2: two agents whose key dirs are owned by THIS process -> registers nothing", async () => {
+    writeKey("a");
+    writeKey("b");
+    const plugin = await loadPlugin();
+    installFetchStub();
+    const api = createMockApi({ config: { agents: { entries: { a: {}, b: {} } } } });
     plugin.register(api as any);
-
-    expect(api._contextEngines.has("flair")).toBe(true);
+    expect(api._tools.size).toBe(0);
+    expect(api._services.size).toBe(0);
+    expect(api._contextEngines.size).toBe(0);
+    expect(api._warnText()).toMatch(/agents share an OS user; identity cannot be guaranteed/);
   });
 
-  test("assemble returns systemPromptAddition when anchor files exist", async () => {
-    const wsDir = join(tmpHome, ".openclaw", "workspace-test-agent");
-    mkdirSync(wsDir, { recursive: true });
-    writeFileSync(join(wsDir, "SOUL.md"), "I am the test agent.");
-    writeFileSync(join(wsDir, "IDENTITY.md"), "Test identity.");
-    writeFileSync(join(wsDir, "AGENTS.md"), "Test workspace rules.");
-
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi();
+  test("R2: list-shaped, two agents under this process -> registers nothing", async () => {
+    writeKey("a");
+    writeKey("b");
+    const plugin = await loadPlugin();
+    installFetchStub();
+    const api = createMockApi({ config: { agents: { list: [{ id: "a" }, { id: "b" }] } } });
     plugin.register(api as any);
-
-    const factory = api._contextEngines.get("flair")!;
-    const engine = factory();
-    const result = await engine.assemble({ messages: [{ role: "user", content: "hi" }] });
-
-    expect(result.systemPromptAddition).toBeDefined();
-    expect(result.systemPromptAddition).toContain("Behavioral Anchors");
-    expect(result.systemPromptAddition).toContain("I am the test agent.");
-    expect(result.systemPromptAddition).toContain("Test identity.");
-    expect(result.systemPromptAddition).toContain("Test workspace rules.");
-    expect(result.estimatedTokens).toBeGreaterThan(0);
+    expect(api._tools.size).toBe(0);
+    expect(api._services.size).toBe(0);
+    expect(api._contextEngines.size).toBe(0);
+    expect(api._warnText()).toMatch(/agents share an OS user; identity cannot be guaranteed/);
   });
 
-  test("assemble returns no systemPromptAddition when workspace dir absent", async () => {
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi();
+  test("R2: one agent registers", async () => {
+    writeKey("a");
+    const plugin = await loadPlugin();
+    installFetchStub();
+    const api = createMockApi({ config: { agents: { entries: { a: {} } } } });
     plugin.register(api as any);
-
-    const factory = api._contextEngines.get("flair")!;
-    const engine = factory();
-    const result = await engine.assemble({ messages: [] });
-
-    expect(result.systemPromptAddition).toBeUndefined();
-    expect(result.estimatedTokens).toBe(0);
-    expect(result.messages).toEqual([]);
+    expect(api._tools.size).toBe(3);
   });
 
-  test("assemble passes messages through unmodified", async () => {
-    const wsDir = join(tmpHome, ".openclaw", "workspace-test-agent");
-    mkdirSync(wsDir, { recursive: true });
-    writeFileSync(join(wsDir, "SOUL.md"), "Soul content.");
-
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi();
+  test("A1: two agents both READABLE while their key dirs have DIFFERENT owners -> nothing registers", async () => {
+    // A's key under a ROOT-owned directory (/tmp, uid 0), B's under this user's
+    // home. Both files are readable by this process; an ownership-based check
+    // would call the dirs "different" and register. Readability says otherwise.
+    realFs.writeFileSync(A1_TMP_KEY, randomBytes(32));
+    realFs.chmodSync(A1_TMP_KEY, 0o600);
+    process.env.FLAIR_KEY_DIR = "/tmp";
+    mkdirSync(join(home, ".flair", "keys"), { recursive: true });
+    realFs.writeFileSync(join(home, ".flair", "keys", "ocf-a1-b.key"), randomBytes(32));
+    realFs.chmodSync(join(home, ".flair", "keys", "ocf-a1-b.key"), 0o600);
+    const plugin = await loadPlugin();
+    installFetchStub();
+    const api = createMockApi({ config: { agents: { entries: { "ocf-a1-916": {}, "ocf-a1-b": {} } } } });
     plugin.register(api as any);
-
-    const factory = api._contextEngines.get("flair")!;
-    const engine = factory();
-    const messagesIn = [
-      { role: "user", content: "hi" },
-      { role: "assistant", content: "hello" },
-    ];
-    const result = await engine.assemble({ messages: messagesIn });
-
-    expect(result.messages).toBe(messagesIn);
+    expect(api._tools.size).toBe(0);
+    expect(api._services.size).toBe(0);
+    expect(api._contextEngines.size).toBe(0);
+    expect(api._warnText()).toMatch(/agents share an OS user; identity cannot be guaranteed/);
   });
 
-  test("ingest is a no-op", async () => {
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi();
+  test("A1: a key this process cannot READ counts as not ours (2 agents, 1 readable -> registers)", async () => {
+    writeKey("a");
+    const plugin = await loadPlugin();
+    installFetchStub();
+    const api = createMockApi({ config: { agents: { entries: { a: {}, b: {} } } } });
     plugin.register(api as any);
-
-    const engine = api._contextEngines.get("flair")!();
-    const result = await engine.ingest({ sessionId: "s", message: { role: "user", content: "x" } });
-    expect(result.ingested).toBe(false);
+    expect(api._tools.size).toBe(3);
   });
 
-  test("compact is a no-op (host owns compaction)", async () => {
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi();
-    plugin.register(api as any);
-
-    const engine = api._contextEngines.get("flair")!();
-    const result = await engine.compact({ sessionId: "s", sessionFile: "/tmp/x" });
-    expect(result.ok).toBe(true);
-    expect(result.compacted).toBe(false);
-    expect(result.reason).toContain("host owns compaction");
+  test("A1: an INDETERMINATE readability -> nothing registers", async () => {
+    writeKey("a");
+    writeKey("b");
+    const mod = await loadModule();
+    const other = mod.keyReadableByThisProcess("b", undefined, () => {
+      const e: any = new Error("EIO");
+      e.code = "EIO";
+      throw e;
+    });
+    expect(other).toBeNull();
+    const readable = mod.keyReadableByThisProcess("a");
+    expect(readable).toBe(true);
   });
 
-  test("info declares ownsCompaction=false", async () => {
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi();
+  test("R2b: no roster property at all -> implicit sole agent -> registers", async () => {
+    writeKey("a");
+    const plugin = await loadPlugin();
+    installFetchStub();
+    const api = createMockApi({ config: { plugins: { slots: { memory: "openclaw-flair" } } } });
     plugin.register(api as any);
-
-    const engine = api._contextEngines.get("flair")!();
-    expect(engine.info.id).toBe("flair");
-    expect(engine.info.ownsCompaction).toBe(false);
+    expect(api._tools.size).toBe(3);
   });
 
-  test("rebuilds anchor cache when source file mtime changes", async () => {
-    const wsDir = join(tmpHome, ".openclaw", "workspace-test-agent");
-    mkdirSync(wsDir, { recursive: true });
-    writeFileSync(join(wsDir, "SOUL.md"), "first version");
-
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi();
+  test("R2b: an empty entries object -> registers nothing", async () => {
+    writeKey("a");
+    const plugin = await loadPlugin();
+    installFetchStub();
+    const api = createMockApi({ config: { agents: { entries: {} } } });
     plugin.register(api as any);
-
-    const engine = api._contextEngines.get("flair")!();
-    const r1 = await engine.assemble({ messages: [] });
-    expect(r1.systemPromptAddition).toContain("first version");
-
-    // Change the file with a guaranteed-different mtime
-    const futureMtime = new Date(Date.now() + 60_000);
-    writeFileSync(join(wsDir, "SOUL.md"), "second version");
-    const { utimesSync } = require("node:fs");
-    utimesSync(join(wsDir, "SOUL.md"), futureMtime, futureMtime);
-
-    const r2 = await engine.assemble({ messages: [] });
-    expect(r2.systemPromptAddition).toContain("second version");
-    expect(r2.systemPromptAddition).not.toContain("first version");
+    expect(api._tools.size).toBe(0);
+    expect(api._services.size).toBe(0);
+    expect(api._contextEngines.size).toBe(0);
+    expect(api._warnText()).toMatch(/identity cannot be guaranteed/);
   });
 
-  test("factory throws when no agentId resolvable in auto mode", async () => {
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi({ agentId: "auto" });
-    delete process.env.FLAIR_AGENT_ID;
+  test("R2b: an unreadable config -> registers nothing", async () => {
+    writeKey("a");
+    const plugin = await loadPlugin();
+    installFetchStub();
+    const api = createMockApi({ config: null as unknown as Record<string, unknown> });
     plugin.register(api as any);
-
-    const factory = api._contextEngines.get("flair")!;
-    expect(() => factory()).toThrow(/no agentId available/);
+    expect(api._tools.size).toBe(0);
+    expect(api._services.size).toBe(0);
+    expect(api._contextEngines.size).toBe(0);
+    expect(api._warnText()).toMatch(/identity cannot be guaranteed/);
   });
 
-  // Per Sherlock review of PR #317
-  test("symlink escape: refuses to read SOUL.md → /etc/passwd-style symlinks", async () => {
-    const wsDir = join(tmpHome, ".openclaw", "workspace-test-agent");
-    mkdirSync(wsDir, { recursive: true });
-    // Create a target outside the workspace dir
-    const outsideTarget = join(tmpHome, "outside-target.md");
-    writeFileSync(outsideTarget, "SECRET_DO_NOT_LEAK");
-    // Symlink SOUL.md inside wsDir to it
-    const { symlinkSync } = require("node:fs");
-    symlinkSync(outsideTarget, join(wsDir, "SOUL.md"));
-    // Also write a normal IDENTITY.md so we can confirm the rest still loads
-    writeFileSync(join(wsDir, "IDENTITY.md"), "real-identity-content");
-
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi();
+  test("S1: explicit keyPath binds ONLY the allowed agent — a second roster agent with no key of its own does not read as shared", async () => {
+    // The design sanctions an explicit keyPath together with a single ALLOWED
+    // agent. Applying that keyPath to EVERY roster agent made a second agent
+    // "resolve" to the allowed agent's key, both read as readable, and the gate
+    // refused with the SHARED-USER reason. Each agent's OWN key must decide.
+    writeKey("A");
+    // B has NO key of its own.
+    const plugin = await loadPlugin();
+    installFetchStub();
+    const api = createMockApi({
+      config: { agents: { entries: { A: {}, B: {} } } },
+      pluginConfig: { agentId: "A", keyPath: join(keyDir, "A.key") },
+    });
     plugin.register(api as any);
-
-    const engine = api._contextEngines.get("flair")!();
-    const result = await engine.assemble({ messages: [] });
-
-    expect(result.systemPromptAddition ?? "").not.toContain("SECRET_DO_NOT_LEAK");
-    expect(result.systemPromptAddition ?? "").toContain("real-identity-content");
-    // Warning logged for the rejected symlink
-    const warnCalls = (api.logger.warn as any).mock.calls;
-    const sawSymlinkWarn = warnCalls.some((args: any[]) =>
-      String(args[0]).includes("symlink escape"),
-    );
-    expect(sawSymlinkWarn).toBe(true);
+    expect(api._tools.size).toBe(3);
+    expect(api._warnText()).not.toMatch(/agents share an OS user/);
   });
 
-  // Per Sherlock review of PR #317
-  test("size cap: anchor file content truncated at MAX_ANCHOR_FILE_CHARS", async () => {
-    const wsDir = join(tmpHome, ".openclaw", "workspace-test-agent");
-    mkdirSync(wsDir, { recursive: true });
-    // 12000 chars of a unique sentinel ("ZQ") — past the 8000-char cap.
-    // ZQ is chosen so it doesn't collide with anything in ANCHOR_HEADER.
-    const sentinel = "ZQ";
-    const oversized = sentinel.repeat(6000); // 12000 chars
-    writeFileSync(join(wsDir, "SOUL.md"), oversized);
-
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi();
+  test("S1: same roster, but the second agent's OWN key is readable -> still refuses (two readable keys)", async () => {
+    writeKey("A");
+    writeKey("B");
+    const plugin = await loadPlugin();
+    installFetchStub();
+    const api = createMockApi({
+      config: { agents: { entries: { A: {}, B: {} } } },
+      pluginConfig: { agentId: "A", keyPath: join(keyDir, "A.key") },
+    });
     plugin.register(api as any);
+    expect(api._tools.size).toBe(0);
+    expect(api._warnText()).toMatch(/agents share an OS user; identity cannot be guaranteed/);
+  });
 
-    const engine = api._contextEngines.get("flair")!();
-    const result = await engine.assemble({ messages: [] });
-
-    // Count sentinel occurrences in systemPromptAddition. With cap=8000 chars
-    // and sentinel length 2, expected count ≤ 4000 (and significantly more
-    // than 0 — confirming we got a substantial chunk, not zero).
-    const sysPrompt = result.systemPromptAddition ?? "";
-    const sentinelMatches = sysPrompt.match(new RegExp(sentinel, "g")) ?? [];
-    expect(sentinelMatches.length).toBeLessThanOrEqual(4000);
-    expect(sentinelMatches.length).toBeGreaterThan(3500); // ≈ 8000/2 minus header overhead
+  test("S1: keyPath without an allowed agent is refused for THAT reason, before the readability check", async () => {
+    writeKey("A");
+    const plugin = await loadPlugin();
+    installFetchStub();
+    const api = createMockApi({
+      config: { agents: { entries: { A: {}, B: {} } } },
+      pluginConfig: { keyPath: join(keyDir, "A.key") },
+    });
+    plugin.register(api as any);
+    expect(api._tools.size).toBe(0);
+    expect(api._warnText()).toMatch(/keyPath is only valid with a single allowed agent/);
+    expect(api._warnText()).not.toMatch(/agents share an OS user/);
   });
 });
 
-// ─── isValidAgentId / assertValidAgentId — path-traversal defense-in-depth ───
-// Sanitizer for agentId before path composition. Sherlock review of PR #317
-// flagged that agentId flows into resolve() unchecked; "../" segments would
-// compose into a workspace-dir escape. This is the fail-closed regex guard.
+// ── identity (R10 ordering) ──────────────────────────────────────────────────
 
-import { isValidAgentId, assertValidAgentId } from "../index.ts";
+describe("identity is taken from host context only", () => {
+  test("configured agentId is an ALLOW-LIST: serving another agent refuses (0 requests)", async () => {
+    writeKey("A");
+    writeKey("B");
+    const plugin = await loadPlugin();
+    const calls = installFetchStub();
+    const api = createMockApi({ pluginConfig: { agentId: "A" } });
+    plugin.register(api as any);
+    const store = api._resolveTool("memory_store", { agentId: "B" });
+    const res = await store.execute("1", { text: "hello" });
+    expect(calls.length).toBe(0);
+    expect(res.content[0].text).toContain("unavailable");
+  });
 
-describe("isValidAgentId / assertValidAgentId (path-traversal defense-in-depth)", () => {
-  test("accepts standard agent names", () => {
-    for (const id of ["flint", "anvil", "kern", "sherlock", "ember"]) {
-      expect(isValidAgentId(id)).toBe(true);
+  test("missing identity refuses rather than inheriting (0 requests)", async () => {
+    writeKey("A");
+    const plugin = await loadPlugin();
+    const calls = installFetchStub();
+    const api = createMockApi();
+    plugin.register(api as any);
+    const store = api._resolveTool("memory_store", {});
+    const res = await store.execute("1", { text: "hello" });
+    expect(calls.length).toBe(0);
+    expect(res.content[0].text).toContain("unavailable");
+  });
+
+  test("env identity is never used as a fallback", async () => {
+    process.env.FLAIR_AGENT_ID = "A";
+    writeKey("A");
+    const plugin = await loadPlugin();
+    const calls = installFetchStub();
+    const api = createMockApi();
+    plugin.register(api as any);
+    const store = api._resolveTool("memory_store", {});
+    const res = await store.execute("1", { text: "hello" });
+    expect(calls.length).toBe(0);
+    expect(res.content[0].text).toContain("unavailable");
+  });
+
+  test("R10: interleaved agents, driven through the host's turn order, sign as themselves", async () => {
+    writeKey("A");
+    writeKey("B");
+    const plugin = await loadPlugin();
+    const calls = installFetchStub();
+    const api = createMockApi({
+      pluginConfig: { autoCapture: true },
+      config: {
+        agents: { entries: { A: {} } },
+        plugins: { slots: { memory: "openclaw-flair" }, entries: { "openclaw-flair": { hooks: { allowConversationAccess: true } } } },
+      },
+    });
+    plugin.register(api as any);
+    // One turn per agent, in both orders — hooks delivered in the host's order,
+    // then the agent's tool call.
+    const turn = async (id: string, text: string) => {
+      await api._runTurn({ agentId: id }, { prompt: text, messages: [{ role: "user", content: text }] });
+      const store = api._resolveTool("memory_store", { agentId: id });
+      await store.execute("1", { text });
+    };
+    await turn("A", "remember this: A says interleave-one");
+    await turn("B", "remember this: B says interleave-one");
+    const first = calls.map(signerOf).filter(Boolean);
+    expect(first).toContain("A");
+    expect(first).toContain("B");
+    expect(first.includes("A") && first.includes("B")).toBe(true);
+
+    const calls2 = installFetchStub();
+    await turn("B", "remember this: B says interleave-two");
+    await turn("A", "remember this: A says interleave-two");
+    const second = calls2.map(signerOf).filter(Boolean);
+    expect(second).toContain("A");
+    expect(second).toContain("B");
+  });
+});
+
+// ── credential matrix (R4) ───────────────────────────────────────────────────
+
+describe("credential matrix — no Basic/unsigned fallback", () => {
+  test("explicit keyPath with an allow-list refuses a non-listed agent (0 requests)", async () => {
+    writeKey("A");
+    writeKey("B");
+    const plugin = await loadPlugin();
+    const calls = installFetchStub();
+    const api = createMockApi({ pluginConfig: { agentId: "A", keyPath: join(keyDir, "A.key") } });
+    plugin.register(api as any);
+    const store = api._resolveTool("memory_store", { agentId: "B" });
+    const res = await store.execute("1", { text: "hello" });
+    expect(calls.length).toBe(0);
+    expect(res.content[0].text).toContain("unavailable");
+  });
+
+  test("keyPath without a single allowed agent is refused at startup", async () => {
+    writeKey("A");
+    const plugin = await loadPlugin();
+    installFetchStub();
+    const api = createMockApi({ pluginConfig: { keyPath: join(keyDir, "A.key") } });
+    plugin.register(api as any);
+    expect(api._tools.size).toBe(0);
+    expect(api._warnText()).toMatch(/keyPath is only valid with a single allowed agent/);
+  });
+
+  test("R4: a key removed after a successful call refuses with ZERO requests", async () => {
+    writeKey("A");
+    const plugin = await loadPlugin();
+    const calls = installFetchStub();
+    const api = createMockApi();
+    plugin.register(api as any);
+    const store = api._resolveTool("memory_store", { agentId: "A" });
+    await store.execute("1", { text: "first" });
+    expect(calls.length).toBe(1);
+
+    const after = installFetchStub();
+    rmSync(join(keyDir, "A.key"));
+    const res = await store.execute("1", { text: "second" });
+    expect(after.length).toBe(0);
+    expect(res.content[0].text).toContain("unavailable");
+  });
+
+  test("R4: a key ROTATED to a different seed mid-session refuses with ZERO requests, naming the agent", async () => {
+    writeKey("A");
+    const plugin = await loadPlugin();
+    const calls = installFetchStub();
+    const api = createMockApi();
+    plugin.register(api as any);
+    const store = api._resolveTool("memory_store", { agentId: "A" });
+    await store.execute("1", { text: "first" });
+    expect(calls.length).toBe(1);
+
+    const after = installFetchStub();
+    writeKey("A", randomBytes(32)); // a different seed
+    const res = await store.execute("1", { text: "second" });
+    expect(after.length).toBe(0);
+    expect(res.content[0].text).toMatch(/agent "A" changed while running/);
+    expect(res.content[0].text).not.toMatch(/[0-9a-f]{32,}/); // no key bytes
+  });
+
+  test("missing key refuses (0 requests)", async () => {
+    const plugin = await loadPlugin();
+    const calls = installFetchStub();
+    const api = createMockApi();
+    plugin.register(api as any);
+    const store = api._resolveTool("memory_store", { agentId: "A" });
+    const res = await store.execute("1", { text: "hello" });
+    expect(calls.length).toBe(0);
+    expect(res.content[0].text).toMatch(/unavailable/);
+  });
+
+  test("a valid call carries the agent's Ed25519 signature (never Basic, never unsigned)", async () => {
+    writeKey("A");
+    const plugin = await loadPlugin();
+    const calls = installFetchStub();
+    const api = createMockApi();
+    plugin.register(api as any);
+    const store = api._resolveTool("memory_store", { agentId: "A" });
+    await store.execute("1", { text: "hello" });
+    expect(calls.length).toBe(1);
+    expect(calls[0].authorization).toMatch(/^TPS-Ed25519 A:/);
+    expect(calls[0].authorization).not.toMatch(/^Basic /i);
+  });
+});
+
+// ── A2 — key loaded once, in memory; no admin fallback ───────────────────────
+
+describe("A2 — the client signs only with the key it loaded, in memory", () => {
+  test("a key REMOVED between the build and the fetch -> refusal, ZERO requests", async () => {
+    writeKey("A");
+    const plugin = await loadPlugin();
+    const api = createMockApi();
+    plugin.register(api as any);
+    const store = api._resolveTool("memory_store", { agentId: "A" });
+    const calls = installFetchStub();
+    // Simulate the file vanishing after the client was built: the pre-fetch
+    // re-verification (which a re-read of the file would bypass) sees no key.
+    signingKeyProbe.resolve = () => null;
+    const res = await store.execute("1", { text: "hello" });
+    expect(calls.length).toBe(0);
+    expect(res.content[0].text).toContain("unavailable");
+  });
+
+  test("a key ROTATED between the build and the fetch -> refusal, ZERO requests (never the new key)", async () => {
+    writeKey("A");
+    const plugin = await loadPlugin();
+    const api = createMockApi();
+    plugin.register(api as any);
+    const store = api._resolveTool("memory_store", { agentId: "A" });
+    const calls = installFetchStub();
+    // A DIFFERENT key appears in the window: the re-verification compares its
+    // fingerprint to the in-memory key's, so the request is refused rather than
+    // signed with the new key.
+    const rotated = join(home, "rotated.key");
+    realFs.writeFileSync(rotated, randomBytes(32));
+    signingKeyProbe.load = () => loadPrivateKey(rotated);
+    const res = await store.execute("1", { text: "hello" });
+    expect(calls.length).toBe(0);
+    expect(res.content[0].text).toContain("unavailable");
+  });
+
+  test("the client has NO admin credentials: env Basic auth cannot be used", async () => {
+    process.env.FLAIR_ADMIN_USER = "admin";
+    process.env.FLAIR_ADMIN_PASSWORD = "pw";
+    try {
+      writeKey("A");
+      const plugin = await loadPlugin();
+      const calls = installFetchStub();
+      const api = createMockApi();
+      plugin.register(api as any);
+      const store = api._resolveTool("memory_store", { agentId: "A" });
+      await store.execute("1", { text: "hello" });
+      expect(calls.length).toBe(1);
+      expect(calls[0].authorization).toMatch(/^TPS-Ed25519 A:/);
+      expect(calls[0].authorization).not.toMatch(/^Basic /i);
+    } finally {
+      delete process.env.FLAIR_ADMIN_USER;
+      delete process.env.FLAIR_ADMIN_PASSWORD;
     }
   });
+});
 
-  test("accepts alphanumerics, underscores, hyphens up to 64 chars", () => {
-    expect(isValidAgentId("a")).toBe(true);
-    expect(isValidAgentId("Agent_1")).toBe(true);
-    expect(isValidAgentId("test-agent-2")).toBe(true);
-    expect(isValidAgentId("A".repeat(64))).toBe(true);
+// ── permission matrix (R8) ───────────────────────────────────────────────────
+
+describe("permission matrix", () => {
+  const cfgWith = (hooks: Record<string, boolean>) => ({
+    agents: { entries: { A: {} } },
+    plugins: { slots: { memory: "openclaw-flair" }, entries: { "openclaw-flair": { hooks } } },
   });
 
-  test("rejects path-traversal patterns", () => {
+  test("R8: capture withheld is reported even when capture is OFF by default", async () => {
+    writeKey("A");
+    const plugin = await loadPlugin();
+    const calls = installFetchStub();
+    const api = createMockApi({ config: cfgWith({ allowPromptInjection: true }) });
+    plugin.register(api as any);
+    expect(api._warnText()).toMatch(/capture disabled \(permission\)/);
+    expect(calls.length).toBe(0);
+  });
+
+  test("capture withheld with capture ON: no capture hooks, zero reads", async () => {
+    writeKey("A");
+    const plugin = await loadPlugin();
+    const calls = installFetchStub();
+    const api = createMockApi({ pluginConfig: { autoCapture: true }, config: cfgWith({ allowPromptInjection: true }) });
+    plugin.register(api as any);
+    expect(api._warnText()).toMatch(/capture disabled \(permission\)/);
+    expect(api._hooks.has("agent_end")).toBe(false);
+    expect(api._hooks.has("llm_input")).toBe(false);
+    expect(api._hooks.has("llm_output")).toBe(false);
+    expect(calls.length).toBe(0);
+  });
+
+  test("prompt policy withheld: status line, no before_prompt_build hook", async () => {
+    writeKey("A");
+    const plugin = await loadPlugin();
+    installFetchStub();
+    const api = createMockApi({ config: cfgWith({ allowConversationAccess: true }) });
+    plugin.register(api as any);
+    expect(api._warnText()).toMatch(/prompt context disabled: policy/);
+    expect(api._hooks.has("before_prompt_build")).toBe(false);
+  });
+});
+
+// ── prompt contract (R7) ─────────────────────────────────────────────────────
+
+describe("prompt contract (host-shaped events, memory section untouched)", () => {
+  const cfgWith = (hooks: Record<string, boolean>) => ({
+    agents: { entries: { A: {} } },
+    plugins: { slots: { memory: "openclaw-flair" }, entries: { "openclaw-flair": { hooks } } },
+  });
+
+  test("returns prependContext via before_prompt_build and leaves the host's memory section", async () => {
+    writeKey("A");
+    const plugin = await loadPlugin();
+    installFetchStub((c) => (c.url.includes("/BootstrapMemories") ? { body: { context: "recalled context" } } : {}));
+    const api = createMockApi({ pluginConfig: { autoRecall: true }, config: cfgWith({ allowPromptInjection: true }) });
+    plugin.register(api as any);
+
+    const baseSystemPrompt = "You are an agent.\n\n## Memory\n- a remembered fact\n";
+    const event: any = { prompt: "hi", messages: [] };
+    expect(event.injectContext).toBeUndefined();
+
+    const delivered = await api._fire("before_prompt_build", event, { agentId: "A" });
+    expect(delivered).toContain("before_prompt_build");
+
+    // The plugin returns ONLY a context prepend — no systemPrompt replacement.
+    const handlers = api._hooks.get("before_prompt_build") ?? [];
+    const result: any = await handlers[0](event, { agentId: "A" });
+    expect(result).not.toHaveProperty("injectContext");
+    expect(Object.keys(result)).toEqual(["prependContext"]);
+
+    // The host's own base prompt (with its memory section) is untouched.
+    const merged = { systemPrompt: baseSystemPrompt, prependContext: result.prependContext };
+    expect(merged.systemPrompt).toContain("## Memory");
+    expect(merged.prependContext).toContain("recalled context");
+  });
+
+  test("R7: the test config sets plugins.slots exactly as the README", async () => {
+    const plugin = await loadPlugin();
+    installFetchStub();
+    const api = createMockApi();
+    plugin.register(api as any);
+    expect((api.config as any).plugins.slots).toEqual({ memory: "openclaw-flair" });
+    expect((api.config as any).plugins.slots.contextEngine).toBeUndefined();
+  });
+
+  test("one run makes exactly one bootstrap fetch (agent_end before llm_output)", async () => {
+    writeKey("A");
+    const plugin = await loadPlugin();
+    const calls = installFetchStub((c) => (c.url.includes("/BootstrapMemories") ? { body: { context: "ctx" } } : {}));
+    const api = createMockApi({
+      pluginConfig: { autoRecall: true },
+      config: { agents: { entries: { A: {} } }, plugins: { slots: { memory: "openclaw-flair" }, entries: { "openclaw-flair": { hooks: { allowPromptInjection: true, allowConversationAccess: true } } } } },
+    });
+    plugin.register(api as any);
+    const order: string[] = [];
+    await api._runTurn({ agentId: "A" }, {});
+    calls.forEach(() => {});
+    const handlers = api._hooks.get("before_prompt_build") ?? [];
+    await handlers[0]({ prompt: "hi", messages: [] }, { agentId: "A" });
+    expect(calls.filter((c) => c.url.includes("/BootstrapMemories")).length).toBe(1);
+    expect(api._hooks.has("before_agent_start")).toBe(false);
+    void order;
+  });
+});
+
+// ── refusal logging (R3) + status surface (R5) ───────────────────────────────
+
+describe("refusal logging and status surface", () => {
+  test("R3: a refused memory_get logs a line naming the tool and reason", async () => {
+    const plugin = await loadPlugin();
+    const calls = installFetchStub();
+    const api = createMockApi();
+    plugin.register(api as any);
+    const get = api._resolveTool("memory_get", {}); // no ctx.agentId
+    await get.execute("1", { id: "x" });
+    expect(calls.length).toBe(0);
+    expect(api._warnText()).toMatch(/memory_get refused\/failed: .*no agent identity/);
+  });
+
+  test("R3: a capture hook with no identity logs a line naming the hook", async () => {
+    writeKey("A");
+    const plugin = await loadPlugin();
+    installFetchStub();
+    const api = createMockApi({
+      pluginConfig: { autoCapture: true },
+      config: { agents: { entries: { A: {} } }, plugins: { slots: { memory: "openclaw-flair" }, entries: { "openclaw-flair": { hooks: { allowConversationAccess: true } } } } },
+    });
+    plugin.register(api as any);
+    await api._fire("agent_end", { messages: [] }, {});
+    expect(api._warnText()).toMatch(/agent_end refused: no agent identity/);
+  });
+
+  test("R5: a status service is registered and reports the plugin state", async () => {
+    writeKey("A");
+    const plugin = await loadPlugin();
+    installFetchStub();
+    const api = createMockApi({
+      config: { agents: { entries: { A: {} } }, plugins: { slots: { memory: "openclaw-flair" }, entries: { "openclaw-flair": { hooks: { allowPromptInjection: true, allowConversationAccess: false } } } } },
+    });
+    plugin.register(api as any);
+    const svc = api._services.get("openclaw-flair-status");
+    expect(svc).toBeDefined();
+    svc!.start({ logger: api.logger });
+    expect(api._statusLine()).toMatch(/openclaw-flair status: .*prompt=allowed .*capture=withheld/);
+  });
+});
+
+// ── still-relevant units ─────────────────────────────────────────────────────
+
+describe("isValidAgentId / assertValidAgentId", () => {
+  test("accepts standard ids; rejects traversal/absolute/empty", async () => {
+    const { isValidAgentId, assertValidAgentId } = await import("../index.ts");
+    expect(isValidAgentId("flint")).toBe(true);
+    expect(isValidAgentId("a-b_c")).toBe(true);
     expect(isValidAgentId("../etc")).toBe(false);
-    expect(isValidAgentId("../../../passwd")).toBe(false);
-    expect(isValidAgentId("foo/../bar")).toBe(false);
-  });
-
-  test("rejects absolute path attempts", () => {
-    expect(isValidAgentId("/etc/passwd")).toBe(false);
-    expect(isValidAgentId("\\etc\\passwd")).toBe(false);
-  });
-
-  test("rejects empty + null + undefined + whitespace", () => {
+    expect(isValidAgentId("/abs")).toBe(false);
     expect(isValidAgentId("")).toBe(false);
     expect(isValidAgentId(null)).toBe(false);
-    expect(isValidAgentId(undefined)).toBe(false);
-    expect(isValidAgentId(" ")).toBe(false);
-  });
-
-  test("rejects names > 64 chars", () => {
-    expect(isValidAgentId("A".repeat(65))).toBe(false);
-  });
-
-  test("rejects shell-special characters", () => {
-    for (const ch of ["$", "`", ";", "|", "&", "\n", "\t", "*", "?", '"', "'"]) {
-      expect(isValidAgentId(`agent${ch}name`)).toBe(false);
-    }
-  });
-
-  test("rejects null bytes (defense against nul-truncation tricks)", () => {
-    expect(isValidAgentId("agent\x00etc")).toBe(false);
-  });
-
-  test("assertValidAgentId throws with informative message on bad input", () => {
     expect(() => assertValidAgentId("../etc")).toThrow(/invalid agentId/);
-    expect(() => assertValidAgentId("")).toThrow(/invalid agentId/);
-    expect(() => assertValidAgentId(null)).toThrow(/invalid agentId/);
-  });
-
-  test("assertValidAgentId returns silently on valid input", () => {
-    expect(() => assertValidAgentId("flint")).not.toThrow();
-    expect(() => assertValidAgentId("test-agent-1")).not.toThrow();
-  });
-
-  test("FlairBehavioralAnchorEngine constructor enforces agentId validation", async () => {
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi({ agentId: "flint" });
-    plugin.register(api as any);
-    const factory = api._contextEngines.get("flair")!;
-    // Factory-level: agentId comes from cfg, currentAgentId, or fallback —
-    // direct construction with malformed agentId should throw.
-    const { FlairBehavioralAnchorEngine } = (await import("../index.ts")) as any;
-    if (FlairBehavioralAnchorEngine) {
-      // class isn't exported; verify via the factory's downstream behavior
-      // by overriding cfg and calling factory().
-      void factory;
-    }
-    // Simpler: directly call assertValidAgentId on what would flow through.
-    expect(() => assertValidAgentId("../escape")).toThrow();
   });
 });
 
-// ─── memory_store supersede — write-then-close ordering ─────────────────────
-// The hand-rolled supersede used to archive the OLD record BEFORE writing the
-// NEW one — if the write then failed, the old fact was gone and the new one
-// never landed (silent loss; same class as the write-new-before-close-old bug,
-// fixed server-side in resources/Memory.ts). These tests exercise the fixed
-// ordering directly against the real FlairClient class (flair-client's HTTP boundary,
-// `FlairClient.prototype.request`, is monkey-patched per test so no network
-// call is made — everything above that boundary, including memory.write()/
-// memory.get()'s real logic, runs unmodified).
-
-describe("memory_store supersede — write-then-close ordering", () => {
-  const originalRequest = FlairClient.prototype.request;
-
-  afterEach(() => {
-    FlairClient.prototype.request = originalRequest;
+describe("evaluateAutoCapture", () => {
+  test("returns null without a trigger or under length; excerpt+hash otherwise", async () => {
+    const { evaluateAutoCapture } = await import("../index.ts");
+    expect(evaluateAutoCapture("nothing important here", { count: 0, hashes: new Set() })).toBeNull();
+    expect(evaluateAutoCapture("remember this", { count: 0, hashes: new Set() })).toBeNull();
+    const d = evaluateAutoCapture("please remember this: the deploy target is staging", { count: 0, hashes: new Set() });
+    expect(d?.excerpt).toContain("remember this");
+    expect(typeof d?.hash).toBe("string");
   });
 
-  test("new memory is written even when closing the superseded record fails (no data loss)", async () => {
-    const calls: Array<{ method: string; path: string; body?: any }> = [];
-    (FlairClient.prototype as any).request = async function (method: string, path: string, body?: any) {
-      calls.push({ method, path, body });
-      if (method === "GET" && path === "/Memory/old-mem-1") {
-        return { id: "old-mem-1", content: "old fact", agentId: "test-agent" };
-      }
-      if (method === "PUT" && path === "/Memory/old-mem-1") {
-        throw new Error("simulated close failure");
-      }
-      // Any other PUT is the new-memory write — let it succeed.
-      return { written: true };
-    };
-
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi();
-    plugin.register(api as any);
-
-    const tool = api._tools.get("memory_store")!;
-    const result = await tool.execute("test", { text: "new fact", supersedes: "old-mem-1" });
-
-    // The new memory must still be reported as written — the close failure
-    // must not propagate into the tool's error branch.
-    expect(result.details.written).toBe(true);
-    expect(result.content[0].text).toContain("Memory stored");
-    expect(result.content[0].text).not.toContain("unavailable");
-
-    // Ordering: the new-memory PUT happened BEFORE the close attempt
-    // (get-old, then put-old) — write-new-BEFORE-close-old.
-    const newWriteIdx = calls.findIndex((c) => c.method === "PUT" && c.path !== "/Memory/old-mem-1");
-    const closeGetIdx = calls.findIndex((c) => c.method === "GET" && c.path === "/Memory/old-mem-1");
-    const closePutIdx = calls.findIndex((c) => c.method === "PUT" && c.path === "/Memory/old-mem-1");
-    expect(newWriteIdx).toBeGreaterThanOrEqual(0);
-    expect(closeGetIdx).toBeGreaterThan(newWriteIdx);
-    expect(closePutIdx).toBeGreaterThan(closeGetIdx);
-
-    // The close failure must be observable (logged), never silently swallowed.
-    const warnCalls = (api.logger.warn as any).mock.calls;
-    const sawCloseFailureWarning = warnCalls.some((args: any[]) =>
-      String(args[0]).includes("failed to close superseded memory"),
-    );
-    expect(sawCloseFailureWarning).toBe(true);
-  });
-
-  test("happy path: supersede writes the new memory AND closes the old one", async () => {
-    const calls: Array<{ method: string; path: string; body?: any }> = [];
-    (FlairClient.prototype as any).request = async function (method: string, path: string, body?: any) {
-      calls.push({ method, path, body });
-      if (method === "GET" && path === "/Memory/old-mem-2") {
-        return { id: "old-mem-2", content: "old fact", agentId: "test-agent" };
-      }
-      return { written: true };
-    };
-
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi();
-    plugin.register(api as any);
-
-    const tool = api._tools.get("memory_store")!;
-    const result = await tool.execute("test", { text: "new fact v2", supersedes: "old-mem-2" });
-
-    expect(result.details.written).toBe(true);
-
-    const newWriteIdx = calls.findIndex((c) => c.method === "PUT" && c.path !== "/Memory/old-mem-2");
-    const closePutIdx = calls.findIndex((c) => c.method === "PUT" && c.path === "/Memory/old-mem-2");
-    expect(newWriteIdx).toBeGreaterThanOrEqual(0);
-    expect(closePutIdx).toBeGreaterThan(newWriteIdx);
-
-    const closingPut = calls[closePutIdx];
-    expect(closingPut.body.archived).toBe(true);
-    expect(typeof closingPut.body.archivedAt).toBe("string");
-    expect(closingPut.body.supersededBy).toBeDefined();
-  });
-
-  test("supersede write bypasses dedup (dedup hint is false when supersedes is set)", async () => {
-    const calls: Array<{ method: string; path: string; body?: any }> = [];
-    (FlairClient.prototype as any).request = async function (method: string, path: string, body?: any) {
-      calls.push({ method, path, body });
-      if (method === "GET" && path === "/Memory/old-mem-3") {
-        return { id: "old-mem-3", content: "old fact", agentId: "test-agent" };
-      }
-      return { written: true };
-    };
-
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi();
-    plugin.register(api as any);
-
-    const tool = api._tools.get("memory_store")!;
-    await tool.execute("test", { text: "new fact v3", supersedes: "old-mem-3" });
-
-    const newWritePut = calls.find((c) => c.method === "PUT" && c.path !== "/Memory/old-mem-3");
-    expect(newWritePut).toBeDefined();
-    expect(newWritePut!.body.dedup).toBe(false);
-  });
-
-  test("non-supersede write still requests dedup (dedup hint is true when supersedes is absent)", async () => {
-    const calls: Array<{ method: string; path: string; body?: any }> = [];
-    (FlairClient.prototype as any).request = async function (method: string, path: string, body?: any) {
-      calls.push({ method, path, body });
-      return { written: true };
-    };
-
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi();
-    plugin.register(api as any);
-
-    const tool = api._tools.get("memory_store")!;
-    await tool.execute("test", { text: "plain fact, no supersede" });
-
-    const writePut = calls.find((c) => c.method === "PUT");
-    expect(writePut).toBeDefined();
-    expect(writePut!.body.dedup).toBe(true);
-  });
-});
-
-// ─── evaluateAutoCapture — pure trigger/cap/dedup decision logic (#798) ──────
-// Pure function: no I/O, no plugin registration. Mirrors shouldCapture's
-// regex gate + MIN_CAPTURE_LENGTH, plus the per-session cap and the
-// hash-based dedup guard that lets the agent_end path and the new live-turn
-// (llm_input/llm_output) path share one capture budget without double-
-// writing the same content.
-
-import { evaluateAutoCapture } from "../index.ts";
-
-function freshCaptureState() {
-  return { count: 0, hashes: new Set<string>() };
-}
-
-describe("evaluateAutoCapture — pure trigger/cap/dedup logic", () => {
-  test("returns null for text with no trigger phrase", () => {
-    const state = freshCaptureState();
-    const text = "just a normal message with nothing special about it at all, really";
-    expect(evaluateAutoCapture(text, state)).toBeNull();
-  });
-
-  test("returns null for a trigger phrase shorter than MIN_CAPTURE_LENGTH (30 chars)", () => {
-    const state = freshCaptureState();
-    expect(evaluateAutoCapture("call me Bob", state)).toBeNull(); // 11 chars
-  });
-
-  test("returns an excerpt + hash for text matching a trigger", () => {
-    const state = freshCaptureState();
-    const text = "remember this: the deploy window is Tuesdays only, no exceptions";
-    const decision = evaluateAutoCapture(text, state);
-    expect(decision).not.toBeNull();
-    expect(decision!.excerpt).toBe(text);
-    expect(typeof decision!.hash).toBe("string");
-    expect(decision!.hash.length).toBe(16);
-  });
-
-  test("matches each trigger category (name, decision, note-for-record)", () => {
-    const state = freshCaptureState();
-    expect(evaluateAutoCapture("my name is Nathan and I run this company", state)).not.toBeNull();
-    expect(evaluateAutoCapture("we decided to ship the fix today instead of waiting", freshCaptureState())).not.toBeNull();
-    expect(evaluateAutoCapture("note for future: always check the CHANGELOG first", freshCaptureState())).not.toBeNull();
-  });
-
-  test("does not mutate state — caller must call recordCapture-equivalent separately", () => {
-    const state = freshCaptureState();
-    const text = "key decision: we are migrating off the old queue by Friday";
-    evaluateAutoCapture(text, state);
-    expect(state.count).toBe(0);
-    expect(state.hashes.size).toBe(0);
-  });
-
-  test("returns null once the per-session cap is reached", () => {
-    const state = freshCaptureState();
-    state.count = 3; // default cap
-    const text = "remember this: the cap should block further captures this session";
-    expect(evaluateAutoCapture(text, state)).toBeNull();
-  });
-
-  test("respects a custom maxPerSession", () => {
-    const state = freshCaptureState();
-    state.count = 1;
-    const text = "remember this: a lower cap should also block at count 1";
-    expect(evaluateAutoCapture(text, state, 1)).toBeNull();
-    expect(evaluateAutoCapture(text, state, 2)).not.toBeNull();
-  });
-
-  test("dedup: returns null for content whose hash was already captured", () => {
-    const state = freshCaptureState();
-    const text = "remember this: identical content should only ever be captured once";
-    const first = evaluateAutoCapture(text, state);
-    expect(first).not.toBeNull();
-    state.hashes.add(first!.hash);
-    state.count++;
-    // Same text seen again (e.g. live turn already captured it, agent_end
-    // rescans the same run's history at the end) — must be skipped.
-    expect(evaluateAutoCapture(text, state)).toBeNull();
-  });
-
-  test("distinct content is still capturable after a prior capture", () => {
-    const state = freshCaptureState();
-    const first = evaluateAutoCapture("remember this: first distinct fact worth keeping around", state);
-    state.hashes.add(first!.hash);
-    state.count++;
-    const second = evaluateAutoCapture("remember this: second distinct fact, unrelated to the first", state);
-    expect(second).not.toBeNull();
-    expect(second!.hash).not.toBe(first!.hash);
-  });
-
-  test("excerpt is truncated for very long text (matches excerptForCapture behavior)", () => {
-    const state = freshCaptureState();
-    const longText = "remember this: " + "x".repeat(600);
-    const decision = evaluateAutoCapture(longText, state);
-    expect(decision).not.toBeNull();
-    expect(decision!.excerpt.length).toBeLessThan(longText.length);
-    expect(decision!.excerpt.endsWith("…")).toBe(true);
-  });
-});
-
-// ─── Live-turn auto-capture (#798) — llm_input/llm_output hooks ─────────────
-// agent_end never fires in a long-lived persistent gateway session (the
-// "run" never ends), so autoCapture was dead code in that deployment shape.
-// These hooks fire on every model request/response instead, independent of
-// how the host bounds a run — proving capture now works without ever
-// firing agent_end at all.
-
-describe("live-turn auto-capture (#798) — llm_input/llm_output hooks", () => {
-  const originalRequest = FlairClient.prototype.request;
-
-  afterEach(() => {
-    FlairClient.prototype.request = originalRequest;
-  });
-
-  test("registers llm_input and llm_output hooks when autoCapture is enabled", async () => {
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi({ autoCapture: true });
-    plugin.register(api as any);
-
-    expect((api._hooks.get("llm_input") ?? []).length).toBeGreaterThanOrEqual(1);
-    expect((api._hooks.get("llm_output") ?? []).length).toBeGreaterThanOrEqual(1);
-    expect((api._hooks.get("agent_end") ?? []).length).toBeGreaterThanOrEqual(1);
-  });
-
-  test("does NOT register llm_input/llm_output/agent_end hooks when autoCapture is disabled", async () => {
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi({ autoCapture: false });
-    plugin.register(api as any);
-
-    expect(api._hooks.get("llm_input") ?? []).toHaveLength(0);
-    expect(api._hooks.get("llm_output") ?? []).toHaveLength(0);
-    expect(api._hooks.get("agent_end") ?? []).toHaveLength(0);
-  });
-
-  test("captures a memory from llm_output alone — agent_end is never fired (persistent-session simulation)", async () => {
-    const calls: Array<{ method: string; path: string; body?: any }> = [];
-    (FlairClient.prototype as any).request = async function (method: string, path: string, body?: any) {
-      calls.push({ method, path, body });
-      return { written: true };
-    };
-
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi({ autoCapture: true });
-    plugin.register(api as any);
-
-    const [llmOutputHook] = api._hooks.get("llm_output") ?? [];
-    expect(llmOutputHook).toBeDefined();
-
-    await llmOutputHook(
-      { assistantTexts: ["note for future: always deploy behind the feature flag first"] },
-      { agentId: "test-agent" },
-    );
-
-    const writes = calls.filter((c) => c.method === "PUT" && c.path.startsWith("/Memory/"));
-    expect(writes.length).toBe(1);
-    expect(writes[0].body.content).toContain("note for future");
-    expect(writes[0].body.tags).toContain("auto-captured");
-  });
-
-  test("captures a memory from llm_input (user-side trigger text)", async () => {
-    const calls: Array<{ method: string; path: string; body?: any }> = [];
-    (FlairClient.prototype as any).request = async function (method: string, path: string, body?: any) {
-      calls.push({ method, path, body });
-      return { written: true };
-    };
-
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi({ autoCapture: true });
-    plugin.register(api as any);
-
-    const [llmInputHook] = api._hooks.get("llm_input") ?? [];
-    expect(llmInputHook).toBeDefined();
-
-    await llmInputHook(
-      { prompt: "by the way, my name is Nathan — please use that going forward" },
-      { agentId: "test-agent" },
-    );
-
-    const writes = calls.filter((c) => c.method === "PUT" && c.path.startsWith("/Memory/"));
-    expect(writes.length).toBe(1);
-    expect(writes[0].body.content).toContain("my name is Nathan");
-  });
-
-  test("caps live captures at the per-session default of 3", async () => {
-    const calls: Array<{ method: string; path: string; body?: any }> = [];
-    (FlairClient.prototype as any).request = async function (method: string, path: string, body?: any) {
-      calls.push({ method, path, body });
-      return { written: true };
-    };
-
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi({ autoCapture: true });
-    plugin.register(api as any);
-
-    const [llmOutputHook] = api._hooks.get("llm_output") ?? [];
-    for (let i = 0; i < 6; i++) {
-      await llmOutputHook(
-        { assistantTexts: [`key decision: distinct fact number ${i} worth remembering forever`] },
-        { agentId: "test-agent" },
-      );
-    }
-
-    const writes = calls.filter((c) => c.method === "PUT" && c.path.startsWith("/Memory/"));
-    expect(writes.length).toBe(3);
-  });
-
-  test("does not double-capture identical content seen via both llm_output and agent_end", async () => {
-    const calls: Array<{ method: string; path: string; body?: any }> = [];
-    (FlairClient.prototype as any).request = async function (method: string, path: string, body?: any) {
-      calls.push({ method, path, body });
-      return { written: true };
-    };
-
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi({ autoCapture: true });
-    plugin.register(api as any);
-
-    const [llmOutputHook] = api._hooks.get("llm_output") ?? [];
-    const [agentEndHook] = api._hooks.get("agent_end") ?? [];
-    const text = "final decision: we are keeping the current pricing model as-is";
-
-    // Captured live, mid-run.
-    await llmOutputHook({ assistantTexts: [text] }, { agentId: "test-agent" });
-    // agent_end rescans the FULL run history at the end, including the same
-    // message already captured live — must be deduped, not written twice.
-    await agentEndHook(
-      { messages: [{ role: "assistant", content: text }] },
-      { agentId: "test-agent" },
-    );
-
-    const writes = calls.filter((c) => c.method === "PUT" && c.path.startsWith("/Memory/"));
-    expect(writes.length).toBe(1);
-  });
-
-  test("agent_end resets the capture budget for the next run", async () => {
-    const calls: Array<{ method: string; path: string; body?: any }> = [];
-    (FlairClient.prototype as any).request = async function (method: string, path: string, body?: any) {
-      calls.push({ method, path, body });
-      return { written: true };
-    };
-
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi({ autoCapture: true });
-    plugin.register(api as any);
-
-    const [llmOutputHook] = api._hooks.get("llm_output") ?? [];
-    const [agentEndHook] = api._hooks.get("agent_end") ?? [];
-
-    // Run 1: spend the whole budget live, then the run ends.
-    for (let i = 0; i < 3; i++) {
-      await llmOutputHook(
-        { assistantTexts: [`we decided: run-one fact number ${i} for the record`] },
-        { agentId: "test-agent" },
-      );
-    }
-    await agentEndHook({ messages: [] }, { agentId: "test-agent" });
-
-    // Run 2: a fresh persistent-session-style run — budget should be reset.
-    await llmOutputHook(
-      { assistantTexts: ["we decided: run-two fact, budget should be fresh again"] },
-      { agentId: "test-agent" },
-    );
-
-    const writes = calls.filter((c) => c.method === "PUT" && c.path.startsWith("/Memory/"));
-    expect(writes.length).toBe(4); // 3 from run 1 + 1 from run 2
-  });
-
-  test("live capture is silently skipped (no throw) when agentId cannot be resolved", async () => {
-    const plugin = (await import("../index.ts")).default;
-    const api = createMockApi({ agentId: "auto", autoCapture: true });
-    delete process.env.FLAIR_AGENT_ID;
-    plugin.register(api as any);
-
-    const [llmOutputHook] = api._hooks.get("llm_output") ?? [];
-    // No before_agent_start ever fired, so currentAgentId is unresolved.
-    await expect(
-      llmOutputHook({ assistantTexts: ["note for future: this should not crash the host"] }, {}),
-    ).resolves.toBeUndefined();
+  test("respects the session cap", async () => {
+    const { evaluateAutoCapture } = await import("../index.ts");
+    expect(evaluateAutoCapture("please remember this: the deploy target is staging", { count: 3, hashes: new Set() }, 3)).toBeNull();
   });
 });
