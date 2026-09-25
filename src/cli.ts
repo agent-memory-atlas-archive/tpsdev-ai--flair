@@ -285,6 +285,15 @@ import {
 } from "./commands/workspace.js";
 import { flairConfigYamlCandidates, readPortFromYamlFile, resolveFlairConfigYaml } from "./lib/doctor-config-path.js";
 import {
+  decideHubReconcile,
+  instanceWriteNotVerifiedMessage,
+  multipleInstanceRowsMessage,
+  readInstanceRows,
+  updateInstanceRole,
+  verifyInstanceWrite,
+  type OpsEndpoint,
+} from "./lib/instance-identity-row.js";
+import {
   collectFederationEnv,
   describeFederationDriverFinding,
   federationPeersConfigured,
@@ -3317,6 +3326,98 @@ export async function seedFederationInstanceViaOpsApi(
   });
 }
 
+// ─── Federation instance identity (flair#1883) ───────────────────────────────
+//
+// A hub's identity is ONE `flair.Instance` row. `GET /FederationInstance`
+// find-or-creates it (`role: "spoke"`); `flair init --remote` used to INSERT a
+// second row under a fresh id, so a hub could hold a spoke row and a hub row and
+// every reader that took "the first row" answered from whichever the table
+// yielded first. `reconcileFederationInstanceViaOpsApi` is init's writer: it
+// reads the rows and decides (create / set the ONE row's role to hub / no-op /
+// refuse), never inserting over an existing identity. The decisions themselves
+// live in src/lib/instance-identity-row.ts, shared with the cleanup sweep and
+// doctor. After it writes, it RE-READS: a row that appeared in its read-then-
+// insert window (a concurrent `GET /FederationInstance` find-or-creates one) is
+// reported with the prune remedy rather than counted as a successful init. The
+// re-read must also hold the row it just WROTE (flair#1883 round 6): an empty
+// table or one different row is refused, naming what was found, because an
+// absent or wrong hub identity is not a completed init.
+
+/** The ops endpoint trio (URL, user, optional pass) as the identity helpers want it. */
+function federationInstanceEndpoint(
+  opsPortOrUrl: number | string,
+  adminUser: string,
+  adminPass?: string,
+  fetchImpl?: typeof fetch,
+): OpsEndpoint {
+  const opsUrl = typeof opsPortOrUrl === "number" ? `http://127.0.0.1:${opsPortOrUrl}` : opsPortOrUrl;
+  return {
+    opsUrl,
+    // A caller without a pass sends no Authorization header — same posture as
+    // seedFederationInstanceViaOpsApi (loopback authorizeLocal).
+    ...(adminPass !== undefined ? { credentials: { user: adminUser, pass: adminPass } } : {}),
+    ...(fetchImpl ? { fetchImpl } : {}),
+  };
+}
+
+/**
+ * Reconcile the hub identity row for `flair init --remote`.
+ *
+ * Returns what actually happened so the caller's log line can name it: an
+ * `already-hub` re-run must not claim it wrote anything.
+ *
+ * The write is verified by re-reading, not assumed (flair#1883 round 2): the
+ * read-then-write window is real, and a `GET /FederationInstance` landing in it
+ * leaves two rows. Reporting that as `created` would claim an identity this
+ * instance does not have.
+ *
+ * The re-read must hold the row it just wrote (flair#1883 round 6): an empty
+ * table (the insert never landed) or one different row (the update went
+ * elsewhere) used to verify as success, and the caller adopted the id anyway.
+ */
+export async function reconcileFederationInstanceViaOpsApi(
+  opsPortOrUrl: number | string,
+  create: { instanceId: string; publicKey: string },
+  adminUser: string,
+  adminPass?: string,
+  opts?: { fetchImpl?: typeof fetch },
+): Promise<{ action: "created" | "updated" | "already-hub"; id: string }> {
+  const endpoint = federationInstanceEndpoint(opsPortOrUrl, adminUser, adminPass, opts?.fetchImpl);
+  const rows = await readInstanceRows(endpoint);
+  const decision = decideHubReconcile(rows);
+  switch (decision.kind) {
+    case "refuse-multiple":
+      throw new Error(multipleInstanceRowsMessage(decision.rows));
+    case "already-hub":
+      return { action: "already-hub", id: decision.id };
+    case "update-role":
+      await updateInstanceRole(endpoint, decision.id, "hub");
+      await assertSingleInstanceRowAfterWrite(endpoint, decision.id);
+      return { action: "updated", id: decision.id };
+    default:
+      // The create path keeps the insert (and its retry/401 guidance) unchanged.
+      await seedFederationInstanceViaOpsApi(opsPortOrUrl, create.instanceId, create.publicKey, "hub", adminUser, adminPass);
+      await assertSingleInstanceRowAfterWrite(endpoint, create.instanceId);
+      return { action: "created", id: create.instanceId };
+  }
+}
+
+/**
+ * Re-read after a write: it must hold exactly the ONE hub row that was written.
+ *
+ * More than one row now means the write raced another writer (a `GET
+ * /FederationInstance` creates one), and the caller must hear the refusal — with
+ * the prune remedy — instead of a success line. An EMPTY table, one OTHER row,
+ * or the expected id with a non-hub role is a failure too (flair#1883 round 6):
+ * each names what the re-read found, because "the write did not land" and "the
+ * write landed elsewhere" are different operator problems.
+ */
+async function assertSingleInstanceRowAfterWrite(endpoint: OpsEndpoint, expectedId: string): Promise<void> {
+  const verification = verifyInstanceWrite(await readInstanceRows(endpoint), expectedId);
+  if (verification.kind === "refuse-multiple") throw new Error(multipleInstanceRowsMessage(verification.rows));
+  if (verification.kind === "not-verified") throw new Error(instanceWriteNotVerifiedMessage(expectedId, verification.found));
+}
+
 // ─── Provision Flair on Harper Fabric ──────────────────────────────────────
 //
 // Atomic provisioning for a fresh Harper Fabric cluster: builds a deploy
@@ -4331,6 +4432,7 @@ bindInitCli({
   provisionFabric,
   pubKeyPath,
   readyOpsSocketPosture,
+  reconcileFederationInstanceViaOpsApi,
   resolveHttpPort,
   writeAdminPassFile,
   resolveOpsBindHost,
