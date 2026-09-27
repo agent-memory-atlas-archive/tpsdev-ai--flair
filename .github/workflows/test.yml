@@ -1,13 +1,14 @@
 name: CI
 
 # LIVENESS COUPLING (flair#1890) — READ BEFORE CHANGING THIS WORKFLOW'S NAME OR
-# ITS `push` TRIGGER. .github/workflows/release-auto-tag.yml is woken ONLY by
-# `workflow_run: workflows: ["CI"], types: [completed]`, and it asserts that the
-# completed run came from this file's path. Renaming this workflow, giving its
-# push trigger a `paths:` filter, or cancelling its runs would mean NO wake for a
-# release — silently, because a trigger that never fires raises nothing. Nothing
-# else tags releases; release-auto-tag.yml's nightly sweep is a recovery net for
-# exactly this class (and for a rename), not a trigger.
+# ITS `push` TRIGGER. .github/workflows/release-auto-tag.yml is triggered by
+# `workflow_run: workflows: ["CI"], types: [completed]`; its decision job
+# accepts only successful pushes to main from this file's path. Renaming
+# this workflow or filtering out a relevant push-to-main event prevents that
+# fast-path trigger. Cancelling a
+# push run before success still triggers `workflow_run: completed`, but the
+# tagger's success guard skips it. The nightly schedule is a recovery trigger
+# for a missed fast path.
 
 # Explicit least privilege: an absent top-level block inherits the repository
 # default, which is not "no write". Every job here reads the repo; the one job
@@ -26,6 +27,16 @@ on:
         description: "Run the integration suite N times in one job (native-spawn flake repro, ops-wumd). Default 1."
         required: false
         default: "1"
+
+# Cancel a pull request's superseded runs. A pull_request run cancels any
+# active run in the same workflow and PR group; an older-head rerun can
+# therefore cancel the current head (rerun the current head if that happens).
+# A paths-filtered event that starts no run cannot cancel anything. Distinct
+# non-PR runs use their run IDs as groups, so this concurrency block does not
+# cancel or serialize push-to-main runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test-unit:
