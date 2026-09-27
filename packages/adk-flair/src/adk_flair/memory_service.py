@@ -141,6 +141,8 @@ class FlairWriteError(FlairRequestError):
     comparing ``status_code`` numerically.
     """
 
+    status_code: int | None
+
     def __init__(
         self, written: int, total: int, failed: List[Tuple[str, Any]], skipped: int = 0
     ):
