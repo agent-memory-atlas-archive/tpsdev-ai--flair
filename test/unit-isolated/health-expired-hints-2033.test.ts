@@ -15,6 +15,7 @@ let platformError = false;
 let logText = "";
 let memoryReadError = false;
 let rows: Array<Record<string, unknown>> = [];
+const originalTransaction = (globalThis as any).transaction;
 
 function absent(): never { throw new Error("fixture path absent"); }
 
@@ -57,12 +58,17 @@ mock.module("harper", () => ({
         if (memoryReadError) throw new Error("memory read failed");
         yield* rows;
       },
-      update: async (id: string, row: Record<string, unknown>) => {
+      update: async (id: string, row: Record<string, unknown>, ctx: any) => {
+        expect(ctx?.transaction?.open).toBe(1);
         const index = rows.findIndex((r) => r.id === id);
         if (index < 0) throw new Error("update requires an existing row");
         rows[index] = structuredClone(row);
       },
       delete: async () => { throw new Error("validTo cleanup must not delete"); },
+    },
+    MemoryHostSource: {
+      search: async function* () {},
+      delete: async (_id: string, ctx: any) => { expect(ctx?.transaction?.open).toBe(1); },
     },
     Agent: { search: async function* () { yield { id: "fixture-agent" }; } },
     MemoryCandidate: { search: async function* () {} },
@@ -127,6 +133,15 @@ const { Command } = await import("commander");
 const { bindCli, register } = await import("../../src/commands/status.ts");
 
 beforeEach(() => {
+  // Maintenance owns the archive/pointer transaction; this fixture has no pointers.
+  (globalThis as any).transaction = async (ctx: any, cb: (txn: any) => unknown) => {
+    const before = structuredClone(rows);
+    const txn = { open: 1, saveCommits: false };
+    ctx.transaction = txn;
+    try { return await cb(txn); }
+    catch (error) { rows = before; throw error; }
+    finally { txn.open = 0; }
+  };
   installed = true;
   active = false;
   platformError = false;
@@ -145,7 +160,11 @@ beforeEach(() => {
 });
 afterEach(() => {
   try { expect(globalThis.fetch).not.toHaveBeenCalled(); }
-  finally { mock.restore(); setSystemTime(); }
+  finally {
+    (globalThis as any).transaction = originalTransaction;
+    mock.restore();
+    setSystemTime();
+  }
 });
 
 const CLEAR = "clear now: flair rem light (archives expired validTo; preview: --dry-run)";

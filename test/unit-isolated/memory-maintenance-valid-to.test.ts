@@ -13,21 +13,71 @@ const AGENT = "fixture-agent";
 
 type Row = { id: string; agentId: string; content: string; [key: string]: unknown };
 const rows = new Map<string, Row>();
+const pointers = new Map<string, { memoryId: string }>();
+type Transaction = { open: number; saveCommits: boolean };
+type Context = { transaction?: Transaction };
+let requestTransaction: Transaction;
+let failingPointerId: string | undefined;
+const events: string[] = [];
+const originalTransaction = (globalThis as any).transaction;
+
+// Exercise the real owned-transaction helper with rollback-capable tables.
+// An existing request transaction must be detached and restored by maintenance.
+const transaction = mock(async (ctx: Context, cb: (txn: Transaction) => unknown) => {
+  expect(ctx.transaction).toBeUndefined();
+  const beforeRows = structuredClone(rows);
+  const beforePointers = structuredClone(pointers);
+  const txn = { open: 1, saveCommits: false };
+  ctx.transaction = txn;
+  try {
+    const result = await cb(txn);
+    events.push("commit");
+    return result;
+  } catch (error) {
+    rows.clear();
+    pointers.clear();
+    for (const [id, row] of beforeRows) rows.set(id, row);
+    for (const [id, pointer] of beforePointers) pointers.set(id, pointer);
+    events.push("abort");
+    throw error;
+  } finally {
+    txn.open = 0;
+  }
+});
+function expectOwned(ctx: Context) {
+  expect(ctx?.transaction?.open).toBe(1);
+  expect(ctx?.transaction).not.toBe(requestTransaction);
+}
+const deletePointer = mock(async (id: string, ctx: Context) => {
+  expectOwned(ctx);
+  events.push(`pointer:${id}`);
+  if (id === failingPointerId) throw new Error("fixture pointer delete failed");
+  pointers.delete(id);
+});
 let failingId: string | undefined;
-const update = mock(async (id: string, row: Row) => {
+const update = mock(async (id: string, row: Row, ctx: Context) => {
+  expectOwned(ctx);
+  events.push(`update:${id}`);
   if (id === failingId) throw new Error("fixture update failed");
   if (!rows.has(id)) throw new Error("update requires an existing row");
   rows.set(id, structuredClone(row));
 });
-const remove = mock(async (id: string) => { rows.delete(id); });
-const noteMemoryUpsert = mock((_row: Row) => {});
+const remove = mock(async (id: string, ctx: Context) => {
+  expectOwned(ctx);
+  rows.delete(id);
+});
+const noteMemoryUpsert = mock((row: Row) => { events.push(`upsert:${row.id}`); });
 const noteMemoryDelete = mock((_id: string) => {});
 mock.module("harper", () => ({
   Resource: class {},
   databases: { flair: { Memory: {
-    search: async function* () { for (const row of rows.values()) yield structuredClone(row); },
+    search: async function* () { for (const row of [...rows.values()]) yield structuredClone(row); },
+    get: async (id: string) => rows.get(id),
     update,
     delete: remove,
+  }, MemoryHostSource: {
+    search: async function* () { yield* [...pointers.values()]; },
+    delete: deletePointer,
   } } },
 }));
 mock.module("../../resources/agent-auth.js", () => ({ isAdmin: async () => false }));
@@ -39,17 +89,31 @@ function seed(id: string, fields: Record<string, unknown> = {}): Row {
   rows.set(id, structuredClone(row));
   return row;
 }
-async function maintain(data: { dryRun?: boolean; agentId?: string } = {}, admin = true) {
+async function maintainRaw(data: { dryRun?: boolean; agentId?: string } = {}, admin = true) {
   const resource = new MemoryMaintenance();
-  resource.getContext = () => ({ request: { tpsAgent: AGENT, tpsAgentIsAdmin: admin } });
+  const ctx = { request: { tpsAgent: AGENT, tpsAgentIsAdmin: admin }, transaction: requestTransaction };
+  resource.getContext = () => ctx;
   expect(resource.allowCreate()).toBe(true);
   const result = await resource.post(data);
+  expect(ctx.transaction).toBe(requestTransaction);
+  expect(requestTransaction.open).toBe(1);
+  return result;
+}
+async function maintain(data: { dryRun?: boolean; agentId?: string } = {}, admin = true) {
+  const result = await maintainRaw(data, admin);
   if (result instanceof Response) throw new Error(await result.text());
   return result;
 }
 
 beforeEach(() => {
   rows.clear();
+  pointers.clear();
+  events.length = 0;
+  requestTransaction = { open: 1, saveCommits: false };
+  failingPointerId = undefined;
+  transaction.mockClear();
+  deletePointer.mockClear();
+  (globalThis as any).transaction = transaction;
   failingId = undefined;
   update.mockClear();
   remove.mockClear();
@@ -60,7 +124,11 @@ beforeEach(() => {
 });
 afterEach(() => {
   try { expect(globalThis.fetch).not.toHaveBeenCalled(); }
-  finally { mock.restore(); setSystemTime(); }
+  finally {
+    (globalThis as any).transaction = originalTransaction;
+    mock.restore();
+    setSystemTime();
+  }
 });
 
 test("archives validTo-expired rows across durability tiers, preserving their data and updating the index", async () => {
@@ -76,7 +144,7 @@ test("archives validTo-expired rows across durability tiers, preserving their da
   for (const original of originals) {
     const archived = { ...original, archived: true, archivedAt: NOW.toISOString() };
     expect(rows.get(original.id)).toEqual(archived);
-    expect(update).toHaveBeenCalledWith(original.id, archived);
+    expect(update).toHaveBeenCalledWith(original.id, archived, expect.any(Object));
     expect(noteMemoryUpsert).toHaveBeenCalledWith(archived);
   }
   expect(remove).not.toHaveBeenCalled();
@@ -123,6 +191,8 @@ test("dry-run counts eligible archives once without writing, deleting or notifyi
   seed("future", { validTo: FUTURE });
   const before = structuredClone([...rows.values()]);
   const result = await maintain({ dryRun: true });
+  expect(transaction).not.toHaveBeenCalled();
+  expect(deletePointer).not.toHaveBeenCalled();
   expect(result.message).toBe("Dry run complete");
   expect(result.archived).toBe(2);
   expect(result.stats.archived).toBe(2);
@@ -166,7 +236,11 @@ test("failed archival is counted as an error, retains the row and allows subsequ
   const failed = seed("failed", { validTo: PAST });
   seed("succeeds", { validTo: PAST });
   failingId = failed.id;
-  const result = await maintain();
+  const response = await maintainRaw();
+  expect(response).toBeInstanceOf(Response);
+  expect((response as Response).status).toBe(500);
+  const result = await (response as Response).json();
+  expect(result.error).toBe("maintenance_incomplete");
   expect(result.errors).toBe(1);
   expect(result.archived).toBe(1);
   expect(result.stats.archived).toBe(1);
@@ -174,4 +248,54 @@ test("failed archival is counted as an error, retains the row and allows subsequ
   expect(rows.get("succeeds")?.archived).toBe(true);
   expect(noteMemoryUpsert).toHaveBeenCalledTimes(1);
   expect(remove).not.toHaveBeenCalled();
+});
+
+
+test("validTo archival guards attributes, preserves provenance and commits before notifying the index", async () => {
+  const provenance = JSON.stringify({ v: 1, verified: { agentId: AGENT }, claimed: { model: "fixture" } });
+  const original = seed("expired-with-pointer", {
+    validTo: PAST, provenance, instanceToken: "stored-token", visibility: "private",
+    hostSource: { v: 1, host: "fixture" }, hostSourceScope: "private", undeclared: "drop",
+  });
+  pointers.set(original.id, { memoryId: original.id });
+  const result = await maintain();
+  const { hostSource, hostSourceScope, undeclared, ...retained } = original;
+  const archived = { ...retained, archived: true, archivedAt: NOW.toISOString() };
+  expect(result.archived).toBe(1);
+  expect(result.orphans).toBe(0);
+  expect(rows.get(original.id)).toEqual(archived);
+  expect(rows.get(original.id)?.provenance).toBe(provenance);
+  expect(update).toHaveBeenCalledWith(original.id, archived, expect.any(Object));
+  expect(pointers.has(original.id)).toBe(false);
+  expect(transaction).toHaveBeenCalledTimes(1);
+  expect(events).toEqual([
+    `update:${original.id}`, `pointer:${original.id}`, "commit", `upsert:${original.id}`,
+  ]);
+  expect(noteMemoryDelete).not.toHaveBeenCalled();
+});
+
+test("a validTo pointer-delete failure rolls back only that archive and later rows still commit", async () => {
+  const failed = seed("failed-pointer", { validTo: PAST, provenance: "stored-provenance" });
+  const succeeds = seed("succeeds", { validTo: PAST });
+  pointers.set(failed.id, { memoryId: failed.id });
+  pointers.set(succeeds.id, { memoryId: succeeds.id });
+  failingPointerId = failed.id;
+  const response = await maintainRaw();
+  expect(response).toBeInstanceOf(Response);
+  expect((response as Response).status).toBe(500);
+  const result = await (response as Response).json();
+  expect(result.error).toBe("maintenance_incomplete");
+  expect(result.errors).toBe(1);
+  expect(result.archived).toBe(1);
+  expect(result.orphans).toBe(0);
+  expect(rows.get(failed.id)).toEqual(failed);
+  expect(pointers.has(failed.id)).toBe(true);
+  expect(rows.get(succeeds.id)?.archived).toBe(true);
+  expect(pointers.has(succeeds.id)).toBe(false);
+  expect(noteMemoryUpsert).toHaveBeenCalledTimes(1);
+  expect(noteMemoryUpsert).toHaveBeenCalledWith(rows.get(succeeds.id));
+  expect(events).toEqual([
+    `update:${failed.id}`, `pointer:${failed.id}`, "abort",
+    `update:${succeeds.id}`, `pointer:${succeeds.id}`, "commit", `upsert:${succeeds.id}`,
+  ]);
 });
