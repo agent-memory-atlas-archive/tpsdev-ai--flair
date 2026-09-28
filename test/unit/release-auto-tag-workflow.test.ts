@@ -15,7 +15,7 @@
  * the invariants: `decide` holds no App credential at all, and every checkout
  * sets `persist-credentials: false`.
  */
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -368,8 +368,57 @@ describe("release-auto-tag workflow — the coupling and the allowlist file", ()
 
 // ── CODEOWNERS: the trust root (#1890, round 4 item 2) ────────────────────────
 
+/**
+ * CODEOWNERS matching, decided by GIT. GitHub documents CODEOWNERS patterns as gitignore patterns
+ * (without "!" negation or "[ ]" ranges), so the oracle is `git check-ignore --no-index` in a
+ * throwaway repository whose .gitignore holds the one pattern. Three rounds of a hand-written
+ * glob-to-regex translation each missed a gitignore rule (zero-directory and trailing "**\/",
+ * anchoring by an internal slash, "**" inside a segment); git has none of those gaps. The oracle is
+ * hermetic: no global or system config, no global excludes file, and case-SENSITIVE matching (a
+ * macOS clone defaults core.ignorecase to true; CODEOWNERS paths are case-sensitive).
+ */
+const CODEOWNERS_ORACLE = mkdtempSync(join(tmpdir(), "codeowners-oracle-"));
+// Every inherited GIT_* variable is dropped: a git hook can export GIT_DIR and GIT_WORK_TREE, which
+// would make check-ignore read the enclosing repository's .gitignore instead of the oracle's
+// (measured: 2 of these tests fail under both variables without the filter).
+const ORACLE_ENV: Record<string, string> = {
+  ...Object.fromEntries(Object.entries(process.env).filter(([k, v]) => !k.startsWith("GIT_") && v !== undefined)) as Record<string, string>,
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_NOSYSTEM: "1",
+};
+afterAll(() => rmSync(CODEOWNERS_ORACLE, { recursive: true, force: true }));
+{
+  const init = spawnSync("git", ["init", "-q", CODEOWNERS_ORACLE], { env: ORACLE_ENV, encoding: "utf8", timeout: 10_000 });
+  if (init.status !== 0) throw new Error(`codeowners oracle: git init failed (${init.status}): ${init.stderr}`);
+  // git init copies the template's info/exclude, which check-ignore reads as its own ignore source
+  // (core.excludesFile does not cover it): the only pattern the oracle may see is the one under test.
+  rmSync(join(CODEOWNERS_ORACLE, ".git", "info", "exclude"), { force: true });
+}
+
+function codeownersMatches(pattern: string, path: string): boolean {
+  if (pattern.startsWith("!") || /[[\]]/.test(pattern)) {
+    throw new Error(`CODEOWNERS does not support "!" or "[ ]" patterns: ${pattern}`);
+  }
+  writeFileSync(join(CODEOWNERS_ORACLE, ".gitignore"), `${pattern}\n`);
+  const r = spawnSync(
+    "git",
+    ["-C", CODEOWNERS_ORACLE, "-c", "core.excludesFile=/dev/null", "-c", "core.ignorecase=false", "check-ignore", "--no-index", "-q", path],
+    { env: ORACLE_ENV, encoding: "utf8", timeout: 10_000 },
+  );
+  if (r.status === 0) return true;
+  if (r.status === 1) return false;
+  throw new Error(`codeowners oracle: git check-ignore failed (${r.status}) for ${pattern} vs ${path}: ${r.stderr}`);
+}
+
 describe("release-auto-tag workflow — the trust root is owned by the repo admin", () => {
-  test("round 4, item 2 (round 6, item 1): CODEOWNERS gives the trust root — the tagger, its workflow, the checker, the allowlist and this file — one owner", () => {
+  /** Every ownership test in this file asks git (codeownersMatches, above). */
+  const matches = codeownersMatches;
+  /**
+   * EFFECTIVE ownership: the LAST matching rule wins (CODEOWNERS order), so a
+   * later rule whose pattern git matches to the path changes the answer, and this
+   * test fails. Repo-relative paths (no leading slash).
+   */
+  function effectiveOwner(path: string): string | null {
     const rules = readFileSync(join(REPO, ".github", "CODEOWNERS"), "utf8")
       .split("\n")
       .map((line) => line.trim())
@@ -378,31 +427,49 @@ describe("release-auto-tag workflow — the trust root is owned by the repo admi
         const [pattern, ...owners] = line.split(/\s+/);
         return { pattern: pattern ?? "", owners: owners.join(" ") };
       });
-    const ownerOf = (pattern: string) => rules.find((r) => r.pattern === pattern)?.owners ?? null;
-    const indexOf = (pattern: string) => rules.findIndex((r) => r.pattern === pattern);
-    // A release PR cannot change what the tagger does (condition 7b), and a
-    // change to the tagger itself needs the repo admin — not a release. The LAST
-    // matching pattern wins in CODEOWNERS, so each specific rule must sit BELOW
-    // the catch-all for it to be the one that applies.
-    for (const pattern of [
-      "/.github/workflows/release-*.yml",
-      "/scripts/release-auto-tag.mjs",
-      "/scripts/check-version-sync.mjs",
-      "/.github/release-auto-tag-advisories.json",
-      "/.github/CODEOWNERS",
+    let owner: string | null = null;
+    for (const r of rules) if (matches(r.pattern, path)) owner = r.owners;
+    return owner;
+  }
+
+  test("every protected path's EFFECTIVE owner (last matching rule) is the repo admin", () => {
+    // Concrete PATHS, not patterns: the matcher resolves which rule actually
+    // applies (last match wins), so an override added later in the file — even
+    // the catch-all moved below a specific rule — turns this red.
+    for (const path of [
+      // #1890: the tagger, its workflow, the checker and the advisory allowlist.
+      ".github/workflows/release-auto-tag.yml",
+      "scripts/release-auto-tag.mjs",
+      "scripts/check-version-sync.mjs",
+      ".github/release-auto-tag-advisories.json",
+      // flair#1928 slice 1: the machinery the promote job will EXECUTE, and the
+      // promote workflows (including the poll itself).
+      "scripts/ci/canary-verdict.sh",
+      "scripts/ci/package-set-digest.mjs",
+      "scripts/ci/registry-tarball-sha256.mjs",
+      "scripts/ci/registry-latest-skew.mjs",
+      "scripts/ci/lockstep-packages.mjs",
+      ".github/workflows/canary.yml",
+      ".github/workflows/release-promote.yml",
+      ".github/workflows/release-promote-poll.yml",
+      // …and the ownership map itself.
+      ".github/CODEOWNERS",
     ]) {
-      expect(ownerOf(pattern), `${pattern} is owned`).toBe("@heskew");
-      expect(indexOf(pattern), `${pattern} is below the catch-all`).toBeGreaterThan(indexOf("*"));
+      expect(effectiveOwner(path), `${path} is owned by the repo admin`).toBe("@heskew");
     }
-    // The ownership map ITSELF (round 6, item 1): without the entry above the
-    // catch-all makes the reviewers team the owner of this file, so a
-    // collaborator with merge access and that team's approval could delete the
-    // trust-root entries and then change the tagger in a later pull request.
-    expect(ownerOf("/.github/CODEOWNERS"), ".github/CODEOWNERS is not left to the catch-all").not.toBe(
-      ownerOf("*"),
-    );
-    // …and the existing catch-all still covers everything else, unchanged.
-    expect(ownerOf("*")).toBe("@tpsdev-ai/reviewers");
+    // NEGATIVE CONTROL: a path nobody protected still falls to the catch-all, so
+    // the matcher is not trivially returning @heskew for everything.
+    expect(effectiveOwner("README.md")).toBe("@tpsdev-ai/reviewers");
+    // Controls for the shapes a hand-written matcher missed (Gauge passes 2 and 3 on #1932), each
+    // answered by git: an override in any of the TRUE shapes would win, so it would turn this red.
+    const poll = ".github/workflows/release-promote-poll.yml";
+    expect(matches("/.github/workflows/**/release-promote-poll.yml", poll)).toBe(true); // zero-directory "**/"
+    expect(matches("/.github/**/", poll)).toBe(true); // trailing "**/"
+    expect(matches("**/canary-verdict.sh", "scripts/ci/canary-verdict.sh")).toBe(true);
+    expect(matches("workflows/release-promote-poll.yml", poll)).toBe(false); // an internal slash anchors
+    expect(matches("/.github/**poll.yml", poll)).toBe(false); // "**" inside a segment stays in it
+    expect(matches("/docs/*.md", "docs/nested/file.md")).toBe(false); // "*" never crosses "/"
+    expect(matches("/.github/workflows/RELEASE-PROMOTE-POLL.yml", poll)).toBe(false); // case-sensitive
   });
 });
 
@@ -420,33 +487,16 @@ describe("CODEOWNERS — the shared Renovate preset is in the trust root (#1930)
     // the last rule whose pattern matches it. Patterns are CODEOWNERS globs
     // (gitignore-style), so a later "/.github/*" or "*.json" rule would override
     // the specific one — match every rule, not only the exact path.
-    const toRegex = (pattern: string): RegExp => {
-      const anchored = pattern.startsWith("/");
-      let body = (anchored ? pattern.slice(1) : pattern).replace(/[.+^${}()|[\]\\]/g, "\\$&");
-      // "**/" matches zero or more directories; any other "**" matches anything; "*" stays within one segment.
-      body = body
-        .replace(/\*\*\//g, "\u0001")
-        .replace(/\*\*/g, "\u0000")
-        .replace(/\*/g, "[^/]*")
-        .replace(/\?/g, "[^/]")
-        .replace(/\u0001/g, "(?:.*/)?")
-        .replace(/\u0000/g, ".*");
-      if (body.endsWith("/")) body += ".*";
-      const prefix = anchored ? "^" : "^(?:.*/)?";
-      // A pattern without a wildcard can name a directory: it matches the path itself or anything below it.
-      return new RegExp(prefix + body + "(?:/.*)?$");
-    };
     const path = ".github/renovate-preset.json";
-    const matches = rules.filter((r) => toRegex(r.pattern).test(path));
+    const matches = rules.filter((r) => codeownersMatches(r.pattern, path));
     expect(matches.at(-1)?.pattern, "the preset's own rule is the last match").toBe("/.github/renovate-preset.json");
     expect(matches.at(-1)?.owners).toBe("@heskew");
     // The matcher itself can fire: a later glob that covers the file would win.
-    expect(toRegex("/.github/*").test(path)).toBe(true);
-    expect(toRegex("*.json").test(path)).toBe(true);
-    expect(toRegex("/docs/*").test(path)).toBe(false);
-    // "**/" includes the zero-directory case: git matches "/.github/**/renovate-preset.json" to the preset.
-    expect(toRegex("/.github/**/renovate-preset.json").test(path)).toBe(true);
-    expect(toRegex("**/renovate-preset.json").test(path)).toBe(true);
+    expect(codeownersMatches("/.github/*", path)).toBe(true);
+    expect(codeownersMatches("*.json", path)).toBe(true);
+    expect(codeownersMatches("/docs/*", path)).toBe(false);
+    expect(codeownersMatches("/.github/**/renovate-preset.json", path)).toBe(true);
+    expect(codeownersMatches("**/renovate-preset.json", path)).toBe(true);
   });
 });
 

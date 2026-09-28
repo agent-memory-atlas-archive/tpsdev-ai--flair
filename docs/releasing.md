@@ -416,3 +416,51 @@ The maintainer who approves staged packages must have 2FA enabled on their npm a
   npm itself; local approvers need a recent npm.
 - Node **≥ 22.14**.
 - Trusted publishing runs on GitHub-hosted runners only (no self-hosted support yet).
+
+## Automated promote — slice 1 (flair#1928)
+
+After the npm approval, a maintainer today pastes the promote block from a
+checkout. Slice 1 lands the four pieces the privileged promote job (slice 2) will
+stand on; it holds no npm credential (the poll runs on the automatic
+`GITHUB_TOKEN` with `actions: write`, `contents: read` and `deployments: read`).
+
+- **The certified digest travels with the release attempt.** The `release-attempt`
+  deployment marker carries a `payload` of `package_set_digest`, `manifest_sha256`
+  and `version`, taken from the values `stage-publish` re-derived from the artifact
+  it staged. It is written BEFORE anything is staged, so a missing or mismatched
+  digest refuses the stage (nothing staged).
+- **A machine surface for the promote block.** `scripts/ci/canary-verdict.sh
+  --emit bash` prints ONLY the executable promote block — byte-identical to the
+  text between the fences a human sees (one definition). A FAIL or a non-release
+  version has no promote block: `--emit bash` exits 3 with one stderr line.
+- **The unprivileged poll.** `release-promote-poll.yml` runs every 10 minutes
+  (`schedule` only — there is no manual trigger, because `gh workflow run --ref <branch>` runs that branch's copy of the workflow, and a guard inside the file cannot bind it to main) and holds NO npm credential: no `environment`,
+  no repo secret — it runs on the automatic `GITHUB_TOKEN` with `actions: write`,
+  `contents: read` and `deployments: read`. It checks out ONLY the default branch
+  at the run's own sha (never a tag's tree), and brings exactly what the package
+  derivation reads (`scripts/ci`, the root `package.json` and
+  `packages/*/package.json`); that derivation FAILS CLOSED — a non-zero exit or an
+  empty list is an error exit that names the cause, never a silent "ready". It
+  reads every `release-attempt` / `promoted` marker across ALL pages
+  (`--paginate`, flattened), and for each pending marker takes the version from the
+  MARKER PAYLOAD (never main's `package.json`, which moves on after a release;
+  never the ref alone — the ref must equal `v<payload.version>` or the marker is
+  refused). It requires EVERY lockstep package `<name>@<version>` to be public and
+  to re-derive the certified package-set digest (ALL-form: one missing/odd package
+  is NOT READY, exit 0, the package named), and on READY dispatches
+  `release-promote.yml --ref v<version>`, gated behind that workflow existing
+  (slice 2). Every run is a schedule run of the default branch's copy of the file, so
+  `github.sha` is always a main sha. **The poll's outputs are
+  never an input to what gets promoted** — the privileged job re-derives everything
+  it acts on. (`test/unit/release-promote-poll-workflow.test.ts`.)
+- **Trust-root ownership.** `.github/CODEOWNERS` puts `/scripts/ci/canary-verdict.sh`,
+  `/scripts/ci/package-set-digest.mjs`, `/scripts/ci/registry-tarball-sha256.mjs`,
+  `/scripts/ci/registry-latest-skew.mjs`, `/scripts/ci/lockstep-packages.mjs`,
+  `/.github/workflows/canary.yml` and `/.github/workflows/release-promote*.yml`
+  under the trust root (`@heskew`); the test resolves EFFECTIVE ownership (last
+  matching rule wins) for each protected path.
+  (`test/unit/release-auto-tag-workflow.test.ts`.)
+
+Not in this slice: the privileged `release-promote.yml`, the `release-promote`
+environment, `NPM_TOKEN`, the machinery-recency guard, and the refusal issue with
+restore lines — all slice 2.
