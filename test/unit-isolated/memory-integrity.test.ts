@@ -1426,7 +1426,7 @@ describe("Memory.delete() — ownership check uses the raw record (super.get), n
 //
 // Foundational capture for an emergent-trust model (see resources/Memory.ts's
 // buildProvenance() doc). Deliberately minimal — verified fields only:
-//   { v: 1, verified: { agentId, timestamp }, claimed?: { model } }
+//   { v: 1, verified: { agentId, timestamp, receivedAt }, claimed?: { createdAt, model, client } }
 //
 // These tests live in THIS file (rather than a new one) for the same reason
 // the within-org-read-open migration-equivalence block above does: bun runs every
@@ -1446,22 +1446,41 @@ describe("memory-provenance slice 1 — Memory.post() write-time stamp", () => {
     expect(prov.v).toBe(1);
     expect(prov.verified.agentId).toBe("agent-1");
     expect(typeof prov.verified.timestamp).toBe("string");
-    // Reuses the same server-clock createdAt the method computed for this write.
-    expect(prov.verified.timestamp).toBe(stored.createdAt);
+    // flair#1960: the SERVER write instant, shared with receivedAt — never the
+    // caller's createdAt. That createdAt is the writer's claim: it stays on the
+    // row AND is recorded under claimed.createdAt.
+    expect(prov.verified.timestamp).toBe(prov.verified.receivedAt);
+    expect(prov.claimed.createdAt).toBe(stored.createdAt);
   });
 
   it("omits claimed.model when the write payload has no model field", async () => {
     const m = makeMemory(agentCtx("agent-1"));
     const r = await m.post({ agentId: "agent-1", content: "No model field on this write at all." });
     const prov = JSON.parse((await BaseMemory.get(r.id)).provenance);
-    expect(prov.claimed).toBeUndefined();
+    expect(prov.claimed.model).toBeUndefined();
+  });
+
+  it("flair#1960: a caller-supplied past createdAt gets a SERVER-time verified.timestamp, keeps the claim on the row, and records it under claimed.createdAt", async () => {
+    const before = Date.now();
+    const past = "2001-01-01T00:00:00.000Z";
+    const m = makeMemory(agentCtx("agent-1"));
+    const r = await m.post({ agentId: "agent-1", content: "Backdated note, long enough for the dedup gate to inspect.", createdAt: past });
+    const stored = await BaseMemory.get(r.id);
+    const prov = JSON.parse(stored.provenance);
+    expect(stored.createdAt).toBe(past); // the record keeps the caller's claim
+    expect(prov.claimed.createdAt).toBe(past); // the claim is recorded, labelled claimed
+    expect(prov.verified.timestamp).not.toBe(past); // verified is the server clock
+    const stamped = Date.parse(prov.verified.timestamp);
+    expect(Number.isFinite(stamped)).toBe(true);
+    expect(stamped).toBeGreaterThanOrEqual(before - 5000);
+    expect(stamped).toBeLessThanOrEqual(Date.now() + 5000);
   });
 
   it("includes claimed.model ONLY when the payload carries one — never invented", async () => {
     const m = makeMemory(agentCtx("agent-1"));
     const r = await m.post({ agentId: "agent-1", content: "This write claims a model, unverified.", model: "claude-opus-4-7" });
     const prov = JSON.parse((await BaseMemory.get(r.id)).provenance);
-    expect(prov.claimed).toEqual({ model: "claude-opus-4-7" });
+    expect(prov.claimed.model).toBe("claude-opus-4-7");
     // claimed.model is UNVERIFIED passthrough — verified.agentId is still the
     // authenticated identity, entirely independent of the claimed model.
     expect(prov.verified.agentId).toBe("agent-1");
@@ -1471,7 +1490,7 @@ describe("memory-provenance slice 1 — Memory.post() write-time stamp", () => {
     const m = makeMemory(agentCtx("agent-1"));
     const r = await m.post({ agentId: "agent-1", content: "Empty-string model field on this write.", model: "" });
     const prov = JSON.parse((await BaseMemory.get(r.id)).provenance);
-    expect(prov.claimed).toBeUndefined();
+    expect(prov.claimed.model).toBeUndefined();
   });
 
   it("no authenticated agent (internal call) stamps verified.agentId: null — never throws", async () => {
@@ -1521,12 +1540,27 @@ describe("memory-provenance slice 1 — Memory.put() stamps the identical shape 
     const m = makeMemory(agentCtx("agent-1"));
     const r = await m.put({ id: "agent-1-put-model", agentId: "agent-1", content: "PUT with a claimed model field.", model: "gpt-5" });
     const prov = JSON.parse((await BaseMemory.get(r.id)).provenance);
-    expect(prov.claimed).toEqual({ model: "gpt-5" });
+    expect(prov.claimed.model).toBe("gpt-5");
 
     const m2 = makeMemory(agentCtx("agent-1"));
     const r2 = await m2.put({ id: "agent-1-put-no-model", agentId: "agent-1", content: "PUT with no claimed model field." });
     const prov2 = JSON.parse((await BaseMemory.get(r2.id)).provenance);
-    expect(prov2.claimed).toBeUndefined();
+    expect(prov2.claimed.model).toBeUndefined();
+  });
+
+  it("flair#1960: put() with a caller-supplied past createdAt stamps a server-time verified.timestamp and records the claim", async () => {
+    const before = Date.now();
+    const past = "2001-01-01T00:00:00.000Z";
+    const m = makeMemory(agentCtx("agent-1"));
+    const r = await m.put({ id: "agent-1-backdated-put", agentId: "agent-1", content: "Backdated PUT, long enough for the gate.", createdAt: past });
+    const stored = await BaseMemory.get(r.id);
+    const prov = JSON.parse(stored.provenance);
+    expect(stored.createdAt).toBe(past);
+    expect(prov.claimed.createdAt).toBe(past);
+    expect(prov.verified.timestamp).not.toBe(past);
+    const stamped = Date.parse(prov.verified.timestamp);
+    expect(stamped).toBeGreaterThanOrEqual(before - 5000);
+    expect(stamped).toBeLessThanOrEqual(Date.now() + 5000);
   });
 
   it("no authenticated agent (internal call) via put() also stamps verified.agentId: null — never throws", async () => {
@@ -1536,6 +1570,174 @@ describe("memory-provenance slice 1 — Memory.put() stamps the identical shape 
     expect(result.written).toBe(true);
     const prov = JSON.parse((await BaseMemory.get(result.id)).provenance);
     expect(prov.verified.agentId).toBeNull();
+  });
+});
+
+describe("flair#1960 r2 — Memory.patch() re-stamps provenance on a semantic write", () => {
+  it("a semantic PATCH on a backdated-legacy row re-stamps verified.* from the server clock (never carries the stored caller-chosen timestamp forward)", async () => {
+    const before = Date.now();
+    // A LEGACY row: provenance written before this release, whose
+    // verified.timestamp came from the caller's createdAt at the time.
+    memoryStore.set("prov-patch-legacy", {
+      id: "prov-patch-legacy",
+      agentId: "agent-1",
+      content: "original body",
+      durability: "standard",
+      createdAt: "2001-01-01T00:00:00.000Z",
+      provenance: JSON.stringify({ v: 1, verified: { agentId: "agent-1", timestamp: "2001-01-01T00:00:00.000Z" } }),
+    });
+    const m: any = makeMemory(agentCtx("agent-1"));
+    m._targetId = "prov-patch-legacy";
+    await m.patch({
+      content: "a genuinely new body",
+      // Forged verified fields in the body — must never land.
+      provenance: JSON.stringify({ v: 1, verified: { agentId: "attacker", timestamp: "1999-01-01T00:00:00.000Z" } }),
+    });
+    const stored = memoryStore.get("prov-patch-legacy");
+    expect(stored.content).toBe("a genuinely new body"); // control: the patch landed
+    const prov = JSON.parse(stored.provenance);
+    expect(prov.verified.agentId).toBe("agent-1"); // forged agentId did not land
+    expect(prov.verified.timestamp).not.toBe("2001-01-01T00:00:00.000Z"); // not the legacy stored value
+    expect(prov.verified.timestamp).not.toBe("1999-01-01T00:00:00.000Z"); // not the forged body value
+    const stamped = Date.parse(prov.verified.timestamp);
+    expect(stamped).toBeGreaterThanOrEqual(before - 5000);
+    expect(stamped).toBeLessThanOrEqual(Date.now() + 5000);
+    expect(prov.verified.timestamp).toBe(prov.verified.receivedAt);
+    expect(prov.claimed.createdAt).toBe("2001-01-01T00:00:00.000Z"); // the record's own creation claim, recorded under claimed
+  });
+
+  it("a metadata-only PATCH (no semantic field change) strips a forged provenance but keeps the stored blob", async () => {
+    const legacy = JSON.stringify({ v: 1, verified: { agentId: "agent-1", timestamp: "2001-01-01T00:00:00.000Z" } });
+    memoryStore.set("prov-patch-meta", {
+      id: "prov-patch-meta", agentId: "agent-1", content: "unchanged body", durability: "standard", provenance: legacy,
+    });
+    const m: any = makeMemory(agentCtx("agent-1"));
+    m._targetId = "prov-patch-meta";
+    await m.patch({ tags: ["tagged"], provenance: JSON.stringify({ v: 1, verified: { agentId: "attacker", timestamp: "1999-01-01T00:00:00.000Z" } }) });
+    const stored = memoryStore.get("prov-patch-meta");
+    expect(stored.tags).toEqual(["tagged"]); // control: the patch landed
+    expect(stored.content).toBe("unchanged body");
+    expect(stored.provenance).toBe(legacy); // no new content authored ⇒ stored blob preserved, forged value never landed
+  });
+});
+
+describe("flair#1960 r3 — Memory.patch() refuses a PATCH when the stored-row READ fails", () => {
+  // The pre-fix control coalesced a thrown stored-row read into `null`
+  // (`.catch(() => null)`); `isSemanticPatch` returns false for `null`, so the
+  // patch fell through to `super.patch()` as a METADATA-ONLY write and kept the
+  // legacy stored blob. A read ERROR is not "no stored row" — the PATCH must be
+  // refused, never degraded to a blob-preserving decision.
+  it("a stored-row read ERROR refuses the PATCH (500) and never delegates to the by-id store write (super.patch)", async () => {
+    const legacy = JSON.stringify({ v: 1, verified: { agentId: "agent-1", timestamp: "2001-01-01T00:00:00.000Z" } });
+    memoryStore.set("prov-patch-readfail", {
+      id: "prov-patch-readfail",
+      agentId: "agent-1",
+      content: "original body",
+      durability: "standard",
+      provenance: legacy,
+    });
+    const m: any = makeMemory(agentCtx("agent-1"));
+    m._targetId = "prov-patch-readfail";
+    // r4/merge: the semantic-PATCH decision and the originatorInstanceId
+    // create/update decision share ONE stored-row read — the #1965
+    // resolveStoredRow, which reads through the URL-bound target id via the
+    // table reader (BaseMemory.get). Make THAT read fail: the write must be
+    // refused, never degraded to a metadata-only blob-preserving decision.
+    const getSpy = spyOn(BaseMemory, "get").mockImplementation(async () => {
+      throw new Error("simulated stored-row read failure");
+    });
+    let superPatchCalls = 0;
+    const realPatch = BaseMemory.prototype.patch;
+    const patchSpy = spyOn(BaseMemory.prototype, "patch").mockImplementation(function (this: any, content: any) {
+      superPatchCalls += 1;
+      return realPatch.call(this, content);
+    });
+    try {
+      const res = await m.patch({ content: "a genuinely new body" });
+      expect(superPatchCalls).toBe(0); // never delegated to the blob-preserving by-id store write
+      expect(res instanceof Response).toBe(true);
+      expect((res as Response).status).toBe(500);
+      await expect((res as Response).json()).resolves.toMatchObject({ error: "stored_row_lookup_failed" });
+      expect(memoryStore.get("prov-patch-readfail").content).toBe("original body"); // nothing landed
+      expect(memoryStore.get("prov-patch-readfail").provenance).toBe(legacy);
+    } finally {
+      getSpy.mockRestore();
+      patchSpy.mockRestore();
+    }
+  });
+});
+
+describe("flair#1960 r4 — createdAt is SEMANTIC (a changed creation claim re-stamps provenance)", () => {
+  it("a createdAt-only PATCH re-stamps provenance and claimed.createdAt follows the new row createdAt", async () => {
+    const before = Date.now();
+    memoryStore.set("prov-patch-createdat", {
+      id: "prov-patch-createdat",
+      agentId: "agent-1",
+      content: "body",
+      durability: "standard",
+      createdAt: "2001-01-01T00:00:00.000Z",
+      provenance: JSON.stringify({
+        v: 1,
+        verified: { agentId: "agent-1", timestamp: "2001-01-01T00:00:00.000Z", receivedAt: "2001-01-01T00:00:00.000Z" },
+        claimed: { createdAt: "2001-01-01T00:00:00.000Z" },
+      }),
+    });
+    const m: any = makeMemory(agentCtx("agent-1"));
+    m._targetId = "prov-patch-createdat";
+    // A createdAt-ONLY patch: no content change. Before r4 this returned false
+    // from isSemanticPatch, so the row's createdAt moved while the stored
+    // claimed.createdAt kept the old value.
+    await m.patch({ createdAt: "2002-02-02T03:04:05.678Z" });
+    const stored = memoryStore.get("prov-patch-createdat");
+    expect(stored.createdAt).toBe("2002-02-02T03:04:05.678Z"); // control: the patch landed
+    const prov = JSON.parse(stored.provenance);
+    // Provenance is RE-STAMPED from the server clock, not carried forward...
+    const stamped = Date.parse(prov.verified.timestamp);
+    expect(stamped).toBeGreaterThanOrEqual(before - 5000);
+    expect(stamped).toBeLessThanOrEqual(Date.now() + 5000);
+    expect(prov.verified.timestamp).toBe(prov.verified.receivedAt);
+    expect(prov.verified.timestamp).not.toBe("2001-01-01T00:00:00.000Z"); // stale stored stamp not carried forward
+    // ...and the claim follows the row: claimed.createdAt is the new row createdAt (sanitized).
+    expect(prov.claimed.createdAt).toBe("2002-02-02T03:04:05.678Z");
+    expect(prov.claimed.createdAt).toBe(stored.createdAt);
+  });
+
+  it("a createdAt-only PATCH whose value needs sanitizing records the sanitized claim, matching the new row createdAt sanitized", async () => {
+    memoryStore.set("prov-patch-createdat-san", {
+      id: "prov-patch-createdat-san",
+      agentId: "agent-1",
+      content: "body",
+      durability: "standard",
+      createdAt: "2001-01-01T00:00:00.000Z",
+    });
+    const m: any = makeMemory(agentCtx("agent-1"));
+    m._targetId = "prov-patch-createdat-san";
+    const RAW = "  2002-02-02T03:04:05.678Z\n";
+    await m.patch({ createdAt: RAW });
+    const stored = memoryStore.get("prov-patch-createdat-san");
+    expect(stored.createdAt).toBe(RAW); // the row keeps the caller's value unchanged
+    const prov = JSON.parse(stored.provenance);
+    expect(prov.claimed.createdAt).toBe("2002-02-02T03:04:05.678Z"); // sanitized: control chars stripped, trimmed
+    expect(prov.claimed.createdAt).toBe(stored.createdAt.trim()); // = sanitizeClaim(row.createdAt)
+  });
+
+  it("a metadata-only PATCH still preserves the stored provenance (and its claimed.createdAt)", async () => {
+    const legacy = JSON.stringify({
+      v: 1,
+      verified: { agentId: "agent-1", timestamp: "2001-01-01T00:00:00.000Z", receivedAt: "2001-01-01T00:00:00.000Z" },
+      claimed: { createdAt: "2001-01-01T00:00:00.000Z" },
+    });
+    memoryStore.set("prov-patch-meta-r4", {
+      id: "prov-patch-meta-r4", agentId: "agent-1", content: "unchanged body", durability: "standard",
+      createdAt: "2001-01-01T00:00:00.000Z", provenance: legacy,
+    });
+    const m: any = makeMemory(agentCtx("agent-1"));
+    m._targetId = "prov-patch-meta-r4";
+    await m.patch({ tags: ["tagged"] });
+    const stored = memoryStore.get("prov-patch-meta-r4");
+    expect(stored.tags).toEqual(["tagged"]); // control: the patch landed
+    expect(stored.provenance).toBe(legacy); // no semantic change ⇒ stored blob preserved
+    expect(JSON.parse(stored.provenance).claimed.createdAt).toBe("2001-01-01T00:00:00.000Z");
   });
 });
 
@@ -1877,12 +2079,13 @@ describe("flair#718 authorship-provenance — Memory.post()/put() claimedClient 
     expect(prov.claimed.client).toBe("gemini"); // reflects the CURRENT write, not the original post()
   });
 
-  it("absent claimedClient → provenance has no `claimed` key at all (never invented, never stamped as empty)", async () => {
+  it("absent claimedClient → provenance carries no claimed.client (claimed.createdAt is still stamped)", async () => {
     const m = makeMemory(agentCtx("agent-1"));
     const r: any = await m.post({ agentId: "agent-1", content: "A plain memory with no client label, long enough for the gate." });
     const stored = await BaseMemory.get(r.id);
     const prov = JSON.parse(stored.provenance);
-    expect("claimed" in prov).toBe(false);
+    expect(prov.claimed.client).toBeUndefined();
+    expect(prov.claimed.createdAt).toBe(stored.createdAt);
   });
 
   it("claimedClient is dropped from the row EVEN when the write is otherwise denied's opposite case — a successful cross-write scenario (supersede) also strips it", async () => {

@@ -47,6 +47,7 @@ import {
   UNAUTH,
   NOT_FOUND,
 } from "./record-type-kit.js";
+import { isSemanticPatch, MEMORY_SEMANTIC_FIELDS } from "./provenance.js";
 import { RECORD_TYPES } from "./record-types.js";
 import { attachTrust } from "./trust-block.js";
 import { recordCitations } from "./usage-recording.js";
@@ -726,9 +727,10 @@ function defaultVisibilityForDurability(durability: unknown): "private" | "share
  * "reuse buildProvenance as-is" contract) instead of a hand-copied format
  * that could drift. See that module for the full field-by-field rationale
  * (verified.agentId from the auth verdict never the body, verified.timestamp
- * = the server-computed createdAt, optional unverified claimed.model /
- * claimed.client passthroughs — the latter added by flair#718 authorship-
- * provenance). Deliberately NOT implemented in this slice: a
+ * = the SERVER write instant (flair#1960), optional unverified
+ * claimed.createdAt / claimed.model / claimed.client passthroughs — the last
+ * two added by flair#718 authorship-provenance). Deliberately NOT implemented
+ * in this slice: a
  * context-fingerprint field — bootstrap doesn't return the IDs a fingerprint
  * would need, so it requires client cooperation that's out of scope here.
  */
@@ -1288,6 +1290,11 @@ export class Memory extends (databases as any).flair.Memory {
       if (stale) return stale;
     }
     stripClientVersionPassthrough(content);
+    // flair#1960 r2: capture the (undeclared) authorship-claim inputs BEFORE the
+    // undeclared-attribute strip removes them, so a semantic PATCH re-stamps
+    // provenance with the SAME claims a post()/put() would record from this body
+    // (a PATCH body's `model`/`claimedClient` are folded into `claimed` only).
+    const claimInputs = { model: (content as any)?.model, claimedClient: (content as any)?.claimedClient };
     // A1' item 1: patch() is a Memory writer too. Drop any pointer inputs and
     // every undeclared attribute here, so a PATCH can never carry a pointer
     // onto the row (the pointer is written ONLY by post()/put() and the table
@@ -1347,17 +1354,43 @@ export class Memory extends (databases as any).flair.Memory {
     // Skills are written via skill_store (→ Memory.post) or Memory.put; no
     // memory_patch tool exists and no internal path patches a skill row (hit-
     // tracking goes through table.put, not this override), so rejecting is safe.
-    // flair#1965 r3: resolve the stored row by the URL-BOUND target id, refusing
-    // a body id that disagrees with the address, and refusing a lookup that
-    // FAILS. The previous `.catch(() => null)` turned a read ERROR into "no
-    // stored row", so the patch (a) skipped the skill-row check and (b) stamped
-    // a CREATE over a row that actually exists. A failed read is never "no row".
-    // See resources/originator-instance.ts's resolveStoredRow.
+    // flair#1965 r3 + flair#1960 r3: resolve the stored row ONCE, by the
+    // URL-BOUND target id — refusing a body `id` that disagrees with the
+    // address, and refusing a lookup that FAILS (a failed read is never "no
+    // stored row"). This ONE resolved row drives BOTH rule sets: the skill-row
+    // check and semantic-PATCH provenance decision below, AND the
+    // originatorInstanceId create/update rule. The previous `.catch(() => null)`
+    // turned a read ERROR into "no stored row"; isSemanticPatch returns false
+    // for `null`, so the patch fell through to `super.patch()` as a
+    // METADATA-ONLY write and kept a legacy stored blob — including a
+    // caller-chosen `verified.timestamp` — in place, and (b) stamped a CREATE
+    // over a row that actually exists. See resources/originator-instance.ts's
+    // resolveStoredRow.
     const resolvedStored = await resolveStoredRow(this, "Memory", content, () => super.get());
     if (resolvedStored.denial) return resolvedStored.denial;
     const existingForSkill = resolvedStored.row;
     const skillDenial = rejectSkillWritePath(content) ?? rejectSkillWritePath(existingForSkill);
     if (skillDenial) return skillDenial;
+    // ── flair#1960 r2: a SEMANTIC patch re-stamps provenance ────────────────
+    // patch() strips a caller-supplied `provenance` (above) so a body can never
+    // SET a `verified.*` field, but stripping alone would leave the STORED blob
+    // in place — including a legacy row whose `verified.timestamp` came from a
+    // client `createdAt` before this release. A patch that changes the record's
+    // content is a fresh authored write, so it re-stamps from the resolved auth
+    // and ONE server clock read (never the caller's `createdAt`, never a carried-
+    // forward stored value). A metadata-only patch (no semantic field changes)
+    // keeps the stored, previously-stamped blob: no new content was authored, so
+    // there is no new write to attribute. See resources/provenance.ts
+    // (isSemanticPatch / MEMORY_SEMANTIC_FIELDS) for the field set.
+    if (isSemanticPatch(content, existingForSkill, MEMORY_SEMANTIC_FIELDS)) {
+      const ctx = (this as any).getContext?.();
+      const auth = await resolveAgentAuth(ctx);
+      content.provenance = buildProvenance(
+        auth,
+        content.createdAt ?? existingForSkill?.createdAt,
+        claimInputs,
+      );
+    }
     // flair#1965 r2: a PATCH over an EXISTING row keeps the stored
     // originatorInstanceId (a body value is dropped); a PATCH whose URL target
     // has NO stored row is a CREATE — Harper's patch path has no existing-row
