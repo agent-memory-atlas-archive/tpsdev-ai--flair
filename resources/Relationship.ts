@@ -2,7 +2,7 @@ import { databases } from "harper";
 import { resolveAgentAuth } from "./agent-auth.js";
 import { guardOwnerFieldImmutable } from "./owner-field-guard.js";
 import { checkRateLimit, rateLimitResponse } from "./rate-limiter.js";
-import { localInstanceId } from "./instance-identity.js";
+import { applyOriginatorInstanceId, resolveStoredRow } from "./originator-instance.js";
 import {
   buildProvenance,
   makeAuthGate,
@@ -133,6 +133,14 @@ export class Relationship extends (databases as any).flair.Relationship {
   async patch(content: any, query?: any) {
     const denial = await guardOwnerFieldImmutable(this, () => super.get(), content, "agentId");
     if (denial) return denial;
+    // flair#1965 r2: an EXISTING row keeps its stored originatorInstanceId (a
+    // body value is dropped); a PATCH whose URL target has no stored row is a
+    // CREATE and must stamp the local id (Harper's patch path does not require
+    // an existing row). The row is resolved by the URL-BOUND target id, never a
+    // body `id`. See resources/originator-instance.ts.
+    const resolvedOriginRow = await resolveStoredRow(this, "Relationship", content, () => super.get());
+    if (resolvedOriginRow.denial) return resolvedOriginRow.denial;
+    await applyOriginatorInstanceId(content, resolvedOriginRow.row);
     return super.patch(content, query);
   }
 
@@ -214,14 +222,17 @@ export class Relationship extends (databases as any).flair.Relationship {
     // persisted as a row field.
     delete content.claimedClient;
 
-    // Write-time originatorInstanceId stamp (federation-edge-hardening slice
-    // 1) — see resources/Memory.ts's stampOriginatorInstanceId doc for the
-    // full contract. No-op if already set (never fires for a genuine local
-    // write; a federation-synced record never reaches this method — the
-    // merge path writes via the raw table object, bypassing this class).
-    if (content.originatorInstanceId == null) {
-      content.originatorInstanceId = await localInstanceId();
-    }
+    // Write-time originatorInstanceId (federation-edge-hardening slice 1): a
+    // CREATE (no stored row) stamps this instance's own id, ignoring any body
+    // value; an UPDATE keeps the STORED value — a body value neither replaces
+    // nor clears it. Relationship has no post(), so put() carries both. See
+    // resources/originator-instance.ts for the full contract (the federation
+    // merge is the raw table writer and never takes a request-body field).
+    // The row is resolved by the URL-BOUND target id, never a body `id` (Harper
+    // writes to the URL target); a mismatch or a failed read refuses the write.
+    const resolvedOriginRow = await resolveStoredRow(this, "Relationship", content, () => super.get());
+    if (resolvedOriginRow.denial) return resolvedOriginRow.denial;
+    await applyOriginatorInstanceId(content, resolvedOriginRow.row);
 
     return super.put(content);
   }
