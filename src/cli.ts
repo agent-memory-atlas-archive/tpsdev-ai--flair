@@ -206,6 +206,9 @@ import {
   classifyPortOwner,
   classifyInstanceMatch,
   shouldAdoptMissingSidecar,
+  classifySidecarStaleness,
+  shouldRemoveSidecarAfterStop,
+  livenessFromKillError,
   parseNullSeparatedEnviron,
   extractRootPath,
   type DaemonEvidence,
@@ -4986,7 +4989,7 @@ function readPidfile(dataDir: string): PidfileRead {
 }
 
 /** Read `flair-daemon.json` (O_NOFOLLOW) into a `SidecarRead`. */
-function readSidecar(dataDir: string): SidecarRead {
+export function readSidecar(dataDir: string): SidecarRead {
   const r = readFileNoFollow(join(dataDir, "flair-daemon.json"));
   if (r.kind !== "present") return r;
   const parsed = parseSidecarJson(r.content);
@@ -4996,15 +4999,16 @@ function readSidecar(dataDir: string): SidecarRead {
   return { kind: "present", ...parsed };
 }
 
-/** `kill(pid, 0)` as a three-way: alive / gone (ESRCH) / eperm (another user's). */
+/** `kill(pid, 0)` as a four-way: alive / gone (ESRCH) / eperm (another user's) / unknown. */
 function probePidLiveness(pid: number): PidLiveness {
   try {
     process.kill(pid, 0);
     return { kind: "alive" };
   } catch (err: any) {
-    if (err?.code === "ESRCH") return { kind: "gone" };
-    if (err?.code === "EPERM") return { kind: "eperm" };
-    return { kind: "gone" };
+    // `gone` ONLY for ESRCH. Any other errno (EINVAL, EACCES, ...) is `unknown`,
+    // which must never be read as "gone" — that is the whole point of the
+    // classifier's unknown state (flair#2055).
+    return livenessFromKillError(err?.code);
   }
 }
 
@@ -5120,11 +5124,27 @@ function inspectServingFlairPackage(pid: number): boolean | null {
 }
 
 /** Gather every piece of evidence the classifier needs, in one place. */
-async function gatherDaemonEvidence(port: number, dataDir: string): Promise<DaemonEvidence> {
+export async function gatherDaemonEvidence(port: number, dataDir: string): Promise<DaemonEvidence> {
   const dataDirUnsafe = checkDataDirSafe(dataDir);
   const pidfile = readPidfile(dataDir);
   const pidLiveness = pidfile.kind === "present" ? probePidLiveness(pidfile.pid) : null;
   let sidecar = readSidecar(dataDir);
+
+  // flair#2055: a sidecar that names a pid which is CONFIRMED gone is STALE, not
+  // a disagreement with hdb.pid. After `flair stop` ended a directly started
+  // Harper, the sidecar it wrote still names the stopped pid; a later instance
+  // under a different supervisor (a systemd unit's Harper) writes its own pid
+  // to hdb.pid, and the old code read the mismatch as an identity conflict and
+  // refused every stop/restart. Dropping the stale sidecar here (treating it as
+  // absent) lets the self-heal below adopt the identity from the LIVE process
+  // on the evidence that process serves — never from the dead pid's record.
+  // Liveness that cannot be determined is NOT stale: the sidecar stays and the
+  // refusal stands (unknown evidence never licenses an action).
+  if (sidecar.kind === "present" && dataDirUnsafe === null) {
+    if (classifySidecarStaleness(sidecar, probePidLiveness(sidecar.pid)).kind === "stale") {
+      sidecar = { kind: "absent" };
+    }
+  }
 
   // Probe health first so the self-heal gate below can use it without a
   // second round-trip. Also consumed at the end for the classifier.
@@ -5226,6 +5246,51 @@ function writeDaemonSidecar(dataDir: string, pid: number, port: number, startTim
 }
 
 /**
+ * Remove the identity sidecar left behind by a stop (flair#2055).
+ *
+ * A sidecar that still names a pid which is CONFIRMED gone is a leftover, and
+ * leaving it makes a later instance under a DIFFERENT supervisor refuse
+ * ("its identity could not be verified"). The removal is gated twice:
+ *
+ *   1. the pid the sidecar names must be CONFIRMED gone (ESRCH) — `unknown` or
+ *      EPERM liveness removes nothing; and
+ *   2. a FRESH O_NOFOLLOW read taken just before the unlink must still name
+ *      that pid. A sidecar another supervisor rewrote in between names a
+ *      different pid and is left alone; a symlinked or malformed one reads as
+ *      `unreadable` and is not removed either, because the re-read never
+ *      followed the link.
+ *
+ * There is no lock: the re-read narrows the window to the gap between the read
+ * and the unlink, and the only loser of that race is a start that rewrote the
+ * sidecar in the gap — a live daemon left with no sidecar, which a later
+ * port-based stop or restart can RECOVER by self-heal once the live process
+ * supplies the required pidfile and health evidence (shouldAdoptMissingSidecar
+ * adopts the identity from the live process; see the recovery test). `flair
+ * status` does not re-adopt. A lock would buy
+ * nothing here and add a crash-recovery hazard, so the design relies on the
+ * self-heal instead. A writer OUTSIDE flair could substitute a symlink after
+ * the final read; that is out of scope (same as any other path flair re-reads
+ * by name). Best-effort: a failure to unlink is reported, never fatal.
+ */
+export function removeStaleSidecarIfConfirmedDead(dataDir: string): void {
+  const observed = readSidecar(dataDir);
+  if (observed.kind !== "present") return;
+  const observedPid = observed.pid;
+  const observedPidLiveness = probePidLiveness(observedPid);
+  // Re-read: only the sidecar that still names the confirmed-dead pid is ours
+  // to remove (a sidecar rewritten in the gap is left alone).
+  const fresh = readSidecar(dataDir);
+  if (!shouldRemoveSidecarAfterStop({ observedPid, observedPidLiveness, sidecar: fresh })) return;
+  const sidecarPath = join(dataDir, "flair-daemon.json");
+  try {
+    unlinkSync(sidecarPath);
+  } catch (err: any) {
+    if (err?.code === "ENOENT") return; // raced with another remover
+    console.error(`could not remove the stale daemon sidecar ${sidecarPath}: ${err?.code ?? err?.message}`);
+  }
+}
+
+/**
  * Refuse to act on a launchd service that belongs to a DIFFERENT data
  * directory than the one the command is operating on (flair#902).
  *
@@ -5307,6 +5372,7 @@ bindServiceCli({
   resolveOpsBindHost,
   resolveOpsPort,
   restartFlair,
+  removeStaleSidecarIfConfirmedDead,
   stampEngineVersionIfRunning,
   waitForHealth,
   waitForProcessExit,
@@ -6604,10 +6670,21 @@ async function stopFlairProcess(port: number, dataDir: string): Promise<void> {
       // WAL/MANIFEST, and the next start fails with a locked data directory if
       // the old process hasn't released it yet.
       try { await waitForProcessExit(pid, STARTUP_TIMEOUT_MS); } catch { /* best-effort — the next start will surface the real problem */ }
+      // flair#2055: once the process is CONFIRMED gone, drop the identity
+      // sidecar. Gated on a fresh O_NOFOLLOW read that still names the pid it
+      // named before (a sidecar another supervisor rewrote in between is left
+      // alone); a process that survived the wait (or whose liveness is unknown)
+      // removes nothing.
+      removeStaleSidecarIfConfirmedDead(dataDir);
       return;
     }
-    case "NOT_RUNNING":
-      return; // idempotent no-op
+    case "NOT_RUNNING": {
+      // Idempotent no-op for the process — but a sidecar left naming a pid that
+      // is CONFIRMED gone is a leftover too (flair#2055), and removing it here
+      // keeps a repeat stop from carrying the refusal forward.
+      removeStaleSidecarIfConfirmedDead(dataDir);
+      return;
+    }
     case "DISAGREEMENT":
     case "UNKNOWN":
       // Deliberately outside any catch: a refusal must reach the caller, not
