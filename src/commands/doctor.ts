@@ -17,7 +17,7 @@ import { buildEd25519Auth, defaultAdminPassPath, defaultKeysDir, resolveAdminUse
 import { flairConfigYamlCandidates, readPortFromYamlFile, resolveFlairConfigYaml } from "../lib/doctor-config-path.js";
 import { collectFederationEnv, describeFederationDriverFinding, federationPeersConfigured, loadYamlDoc } from "../lib/doctor-federation-driver.js";
 import { plistCarriesInlineAdminPassword } from "../lib/launchd-management.js";
-import { DOCTOR_CHECK_IDS, catalogIssueDelta, mcpRepinIcon, renderCatalogDoctorLines, runDoctorChecks } from "../lib/doctor-run.js";
+import { DOCTOR_CHECK_IDS, catalogIssueDelta, mcpRepinIcon, probeFlairHealth, renderCatalogDoctorLines, runDoctorChecks, type WorkerThreadsObservation } from "../lib/doctor-run.js";
 import { describeEmbedGpuDoctorFinding } from "../lib/embed-gpu-doctor.js";
 import { adminPassDesyncFinding, detectPersistedAdminUser } from "../lib/init-admin-pass.js";
 import { opsApiBindFinding } from "../lib/ops-api-bind.js";
@@ -463,22 +463,13 @@ program
       }
     }
 
-    // Helper: try to reach Harper on a given port.
-    // Must return true ONLY when Harper's /Health endpoint returns 200 OK.
-    // A generic HTTP status > 0 (flair#862) would accept 404 from a Node
-    // inspector on 9229 or any other service — "present but wrong" beats
-    // "absent but correct".
+    // Probe a port's /Health.
     async function probePort(p: number): Promise<boolean> {
-      try {
-        const res = await fetch(`http://127.0.0.1:${p}/Health`, { signal: AbortSignal.timeout(3000) });
-        return res.ok; // 200-299 only — /Health returns { ok: true } on 200
-      } catch { return false; }
+      const probe = await probeFlairHealth(`http://127.0.0.1:${p}/Health`);
+      return probe.reaching;
     }
 
-    // Helper: discover what port a Harper PID is listening on.
-    // Scans ALL listening ports for this PID and returns the first one that
-    // responds to /Health with 200 OK. This avoids picking a debug port (9229)
-    // or any non-Flair listener that happens to share the process (flair#862).
+    // Find the PID's port by probing /Health.
     async function discoverPortFromPid(pid: string): Promise<number | null> {
       // Defense-in-depth: caller already validates, but re-check here
       if (!/^\d+$/.test(pid)) return null;
@@ -488,7 +479,6 @@ program
         // Extract all ports from lsof -Fn output (lines like "n127.0.0.1:PORT")
         const ports = [...out.matchAll(/n(?:\S+):(\d+)/g)].map(m => Number(m[1]));
         if (ports.length === 0) return null;
-        // Try each port until one responds to /Health with 200 OK
         for (const port of ports) {
           if (await probePort(port)) return port;
         }
@@ -600,13 +590,17 @@ program
     // picture here instead of a one-liner and `--fix` offers the restart.
     let runningVersion: string | null = null;
     let embedGpuFromHealth: unknown;
+    let workerThreads: WorkerThreadsObservation | undefined;
     if (harperResponding) {
       try {
-        const healthRes = await fetch(`${baseUrl}/Health`, { signal: AbortSignal.timeout(3000) });
-        if (healthRes.ok) {
-          const body = (await healthRes.json()) as { version?: unknown; embedding?: unknown };
-          runningVersion = typeof body?.version === "string" ? body.version : null;
-          embedGpuFromHealth = body.embedding;
+        const probe = await probeFlairHealth(`${baseUrl}/Health`);
+        if (probe.reaching) {
+          workerThreads = probe.observation ?? undefined;
+          if (probe.status >= 200 && probe.status < 300 && probe.body && typeof probe.body === "object") {
+            const healthBody = probe.body as { version?: unknown; embedding?: unknown };
+            runningVersion = typeof healthBody.version === "string" ? healthBody.version : null;
+            embedGpuFromHealth = healthBody.embedding;
+          }
         }
       } catch { /* leave runningVersion null — reported below as "unknown" */ }
 
@@ -1062,6 +1056,7 @@ program
       keysDir,
       keyAgentIds,
       agentFlag: typeof opts.agent === "string" ? opts.agent : undefined,
+      workerThreads,
     };
     const catalogBefore = runDoctorChecks(doctorCtx, { catalogIds: doctorCatalogIds });
     // flair#1834 PR-H: a hook file on disk IS the wiring — the same rule the

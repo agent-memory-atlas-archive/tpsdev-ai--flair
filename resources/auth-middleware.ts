@@ -6,6 +6,7 @@ import { WINDOW_MS, importEd25519Key, b64ToArrayBuffer, parseTpsEd25519Header } 
 import { isKnownAgentReplay, claimAgentNonce } from "./replay-store.js";
 import { isForbiddenOwnerMutation, ownerMutationRefusal, resolveGuardedRecord } from "./record-owner-guard.js";
 import { checkHttpRateLimit } from "./rate-limit.js";
+import { FLAIR_AUTH_MIDDLEWARE_HTTP_NAME } from "./multi-worker-guard.js";
 import { stripUndeclaredMemoryAttributes, DECLARED_MEMORY_ATTRIBUTES } from "./memory-declared-attributes.js";
 
 // --- Non-admin Memory read: ignore the caller's selection --------------------
@@ -790,4 +791,4 @@ server.http(async (request: any, nextLayer: any) => {
   }
 
   return response;
-}, { runFirst: true });
+}, { runFirst: true, name: FLAIR_AUTH_MIDDLEWARE_HTTP_NAME });

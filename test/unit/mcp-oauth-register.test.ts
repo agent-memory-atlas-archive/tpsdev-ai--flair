@@ -1,18 +1,4 @@
-/**
- * mcp-oauth-register.test.ts — the flag-OFF NO-OP contract for /mcp registration.
- *
- * registerMcpOAuthRoute() must:
- *   - flag OFF  → NEVER call server.http, NEVER load the oauth plugin (returns
- *     false). This is the byte-identical boot contract.
- *   - flag ON but no issuer → NEVER mount (no floating-issuer guard) → false.
- *   - flag ON + issuer → register withMCPAuth(handler) on urlPath '/mcp' ONLY.
- *
- * We call the exported registration function directly with injected deps (a spy
- * server + a stub withMCPAuth loader), so the test never depends on the load-time
- * side effect or the real Harper `server`. harper is mocked only so
- * the module's static `import { server }` resolves; the module-level fire-and-
- * forget call runs with the flag OFF (default) and returns before touching it.
- */
+// MCP OAuth route registration.
 
 import { mock, describe, it, expect, beforeEach } from "bun:test";
 
@@ -42,6 +28,7 @@ mock.module("harper", () => ({
 
 const { registerMcpOAuthRoute, mcpRouteState, rateLimitedMcpHandler } = await import("../../resources/mcp-oauth.ts");
 const { __resetBucketsForTest } = await import("../../resources/rate-limit.ts");
+const { MULTI_WORKER_GUARD_HTTP_NAME } = await import("../../resources/multi-worker-guard.ts");
 
 const ENV = ["FLAIR_MCP_OAUTH", "FLAIR_MCP_ISSUER", "FLAIR_PUBLIC_URL"];
 function clearEnv() { for (const k of ENV) delete process.env[k]; }
@@ -103,8 +90,7 @@ describe("registerMcpOAuthRoute — flag-OFF no-op", () => {
     const mounted = await registerMcpOAuthRoute(deps);
     expect(mounted).toBe(true);
     expect(httpCalls).toHaveLength(1);
-    // Registered on the /mcp urlPath subroute (its own chain).
-    expect(httpCalls[0].options).toEqual({ urlPath: "/mcp" });
+    expect(httpCalls[0].options).toEqual({ urlPath: "/mcp", after: MULTI_WORKER_GUARD_HTTP_NAME });
     // The registered handler is the withMCPAuth-wrapped one.
     expect(httpCalls[0].handler.__wrapped).toBe(true);
     // getConfig pins iss/resource for the wrapper.
@@ -213,7 +199,7 @@ describe("mcpRouteState — the router's own record of the mount decision", () =
     process.env.FLAIR_MCP_ISSUER = "https://flair.example.com";
     await registerMcpOAuthRoute(makeDeps());
     expect(mcpRouteState().mounted).toBe(true);
-    expect(httpCalls[0].options).toEqual({ urlPath: "/mcp" });
+    expect(httpCalls[0].options).toEqual({ urlPath: "/mcp", after: MULTI_WORKER_GUARD_HTTP_NAME });
   });
 
   it("the recorded state always agrees with the returned mounted value", async () => {

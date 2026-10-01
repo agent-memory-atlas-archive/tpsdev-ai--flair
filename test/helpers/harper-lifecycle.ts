@@ -759,6 +759,7 @@ export interface StartHarperOptions {
    * one worker regardless, so such a test must skip there.
    */
   threads?: number;
+  multiWorkerUnsafe?: boolean;
   /**
    * Raw YAML appended to the instance's `harperdb-config.yaml` AFTER `harper
    * install` writes it and BEFORE `harper run` boots (flair#1257 slice 3).
@@ -801,6 +802,17 @@ export interface StartHarperOptions {
   orphanExitPreload?: boolean;
 }
 
+export function applyMultiWorkerUnsafeSpawnOption(
+  env: Record<string, string>,
+  opts: Pick<StartHarperOptions, "threads" | "multiWorkerUnsafe">,
+): void {
+  if (opts.multiWorkerUnsafe === false) {
+    delete env.FLAIR_MULTI_WORKER_UNSAFE;
+  } else if ((opts.threads ?? 1) > 1) {
+    env.FLAIR_MULTI_WORKER_UNSAFE = "1";
+  }
+}
+
 export async function startHarper(opts: StartHarperOptions = {}): Promise<HarperInstance> {
   const cwd = opts.cwd ?? process.cwd();
   const harperBinDir = opts.harperBinDir ?? cwd;
@@ -808,6 +820,9 @@ export async function startHarper(opts: StartHarperOptions = {}): Promise<Harper
 
   // ── External mode: connect to Docker service ─────────────────────────────
   if (HARPER_HTTP_URL) {
+    if (opts.multiWorkerUnsafe === false) {
+      throw new Error("[harper-lifecycle] refused fixture requires local spawn; external HARPER_HTTP_URL cannot honor multiWorkerUnsafe: false");
+    }
     const httpURL = HARPER_HTTP_URL;
     const opsURL = HARPER_OPS_URL_ENV ?? httpURL.replace(/:(\d+)($|\/)/, (_, port, rest) => `:${Number(port) - 1}${rest}`);
     console.log(`[harper-lifecycle] external mode: httpURL=${httpURL} opsURL=${opsURL} user=${HARPER_ADMIN_USER}`);
@@ -890,6 +905,7 @@ export async function startHarper(opts: StartHarperOptions = {}): Promise<Harper
     MQTT_WEBSOCKET: "false",
     THREADS_DEBUG: "false",
   };
+  applyMultiWorkerUnsafeSpawnOption(baseEnv, opts);
   // flair#1450: the child must exit when this process dies. The exit hook
   // above cannot cover SIGKILL of the harness (and we cannot install signal
   // handlers — federation-watch.test.ts SIGTERMs the runner as a fixture).

@@ -4,6 +4,7 @@ import { homedir, platform } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { allowVerified, resolveAgentAuth } from "./agent-auth.js";
+import { multiWorkerCondition, multiWorkerHealthField } from "./multi-worker-guard.js";
 import { resolveBuildInfo } from "./build-info.js";
 import { getMigrationStatusSnapshot } from "./migrations/status.js";
 import { resolveMigrationDataDirForRead } from "./migrations/data-dir.js";
@@ -121,9 +122,16 @@ export class Health extends Resource {
       version: build?.version ?? resolveVersion(),
       buildCommit: build?.commit ?? null,
     }));
-    if (readiness.status !== 200) {
+    const multiWorker = multiWorkerHealthField(multiWorkerCondition());
+    let status = readiness.status;
+    if (multiWorker) {
+      body.ok = false;
+      body.multiWorker = multiWorker;
+      status = 503;
+    }
+    if (status !== 200) {
       return new Response(JSON.stringify(body), {
-        status: readiness.status,
+        status,
         headers: { "content-type": "application/json" },
       });
     }
