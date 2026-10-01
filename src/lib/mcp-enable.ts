@@ -2029,8 +2029,8 @@ export async function enableMcp(params: EnableMcpParams, deps: EnableMcpDeps = {
         `Exactly one active credential per (kind, idpSubject) is the invariant that keeps resolution deterministic.`
       : "";
     push(true,
-      `connector identity: sub '${params.idpSubject}' (provider '${idpProvider}') resolves to Agent '${principal}' — ` +
-        `every /mcp call reads and writes AS '${principal}'. ` +
+      `connector identity: mapped sub '${params.idpSubject}' (provider '${idpProvider}') to Agent '${principal}'; ` +
+        `see docs/access-control.md for how /mcp tool calls use it. ` +
         `principal ${mapping.principalCreated ? "created" : "already existed"}; ` +
         `Credential(kind:idp) ${mapping.credentialReused ? "re-pointed" : "created"} (${mapping.credentialId}).` +
         `${supersedeNote} ` +
