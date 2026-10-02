@@ -29,12 +29,14 @@ import {
   classifyRecord,
   reconstructRecordVerifyBody,
   checkPrincipalEntitlement,
+  inboundChangesExistingPrincipalStatus,
   type FederationSyncTable,
 } from "./federation-classify.js";
 export {
   classifyRecord,
   reconstructRecordVerifyBody,
   checkPrincipalEntitlement,
+  inboundChangesExistingPrincipalStatus,
   recordSignatureVersion,
   PRINCIPAL_OWNING_TABLES,
   FEDERATION_TABLE_POLICY,
@@ -825,6 +827,19 @@ export class FederationSync extends Resource {
         });
         if (principalSkip) {
           recordSkip(principalSkip);
+          continue;
+        }
+
+        // ── flair#2108: skip an inbound Agent record whose `status` differs
+        // from an existing local principal's stored value, whether or not it
+        // would win the last-write-wins merge below. The federation path
+        // carries no verified administrator authority for that principal (the
+        // batch is signed, and a record signature may also be present; neither
+        // is an admin claim). The whole record is skipped rather than merged
+        // with a pinned status, so the merge stays atomic and the other fields
+        // in the record do not land either.
+        if (inboundChangesExistingPrincipalStatus(record, local)) {
+          recordSkip("agent_status_not_federated");
           continue;
         }
 
