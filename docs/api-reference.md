@@ -493,6 +493,7 @@ ed25519 / idp) and **Integration** (legacy platform connection).
 | **Asset** | memory.graphql | yes | Blob (`contentType`, `data`) owned by `agentId`, linked by `memoryId` |
 | **OrgSkillAssignment** | memory.graphql | yes | Org-scope skill assignment (`skillName`, `skillRef`, `priority`, server-stamped `writer` / `sourceClass`) |
 | **OrgSkillAssignmentHistory** | memory.graphql | no | One row per accepted OrgSkillAssignment resource write (`assignmentId`, `op`, `actor`, `sourceClass`, `previousHash`) |
+| **InstructionVersion** | memory.graphql | yes (read only) | History for single-row Soul resource writes. Soul collection deletes and InstructionVersion REST writes are refused. Reads authorize `soul` subjects under Soul's verified-agent rule. |
 | **WorkspaceState** | workspace.graphql | yes | Current work (`ref`, `provider`, `phase`, `entities`) |
 | **OrgEvent** | event.graphql | yes | Org-visible event (`authorId`, `kind`, `summary`, `entities`) |
 | **AgentReadPosition** | agent.graphql | no | Per-agent watermark (`agentId`, `stream`, `position`). HTTP via `/AgentReadPosition`, not raw-table REST. |
@@ -503,6 +504,8 @@ ed25519 / idp) and **Integration** (legacy platform connection).
 | **IdpConfig** | oauth.graphql | yes | XAA IdP (`issuer`, `jwksUri`, `requiredDomain`) |
 | **IdJagReplay** | oauth.graphql | no | Used ID-JAG `jti` values |
 | **OAuthSingleUse** | oauth.graphql | no | A claim to redeem an authorization code or rotate a refresh token, keyed by its SHA-256 |
+
+`InstructionVersion` rows are appended by Flair's in-process write path. The administrator operations API (`upsert` / `delete` under admin auth) can also write version rows, and that path is not audited by this table — a documented, deferred exception.
 
 ---
 
