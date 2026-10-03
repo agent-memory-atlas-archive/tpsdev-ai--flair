@@ -137,6 +137,14 @@ You didn't ask for that, and it isn't a setting you have to remember. Flair deri
 | `permanent`, `persistent` | `shared` — a fact or decision worth keeping is worth the team being able to find |
 | `standard`, `ephemeral` — including a bare write with no `--durability` | `private` — working context and scratch state belong to the agent that produced them |
 
+Retention, decay and bootstrap ordering by tier:
+
+- permanent — routine maintenance never reaps or age-archives it (an expired validTo archives an eligible row; an acquired expiresAt never reaps it); it never decays; bootstrap considers the bootstrapping agent's own permanent memories before recent rows, subject to scope, expiry/closure and the token budget.
+- persistent — routine maintenance never reaps or age-archives it (an expired validTo archives an eligible row; an acquired expiresAt never reaps it).
+- standard — routine maintenance archives it once its validTo passes or, as a session note, after 30 days.
+- ephemeral — routine maintenance reaps it once its TTL (24h by default) passes.
+- No tier adds a flush, fsync, backup or replica acknowledgement: an explicit delete (owner or admin) or a store failure can end any of them.
+
 So sharing is a deliberate act, and it takes one flag:
 
 ```bash
