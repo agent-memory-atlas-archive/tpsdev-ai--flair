@@ -5,7 +5,7 @@ import { computeContentHash, findExistingMemoryByContentHash } from "./memory-fe
 import { FORBIDDEN, UNAUTH, stampAttribution } from "./record-type-kit.js";
 import { guardAuthorityFields, stripAuthorityFields } from "./authority-field-guard.js";
 import { assertValidVisibility, assertVisibilityAllowedForDurability, PRIVATE_VISIBILITY, SHARED_VISIBILITY } from "./memory-visibility.js";
-import { assertValidDurability } from "./memory-durability.js";
+import { assertValidDurability, stampEphemeralExpiry } from "./memory-durability.js";
 import { enforceSkillDurability, isSkillWrite, refuseSkillWriteSource, skillScanGate } from "./skill-write.js";
 import { buildSkillSuccessorRow, closedSkillPayloadReadable, defaultSkillHooks, resolveSkillHead, runSkillVersionWrite, skillVersionVisibility, prepareSkillBody, validateSkillSnapshots, authorizeSkillOwners, skillWriteConflict } from "./skill-version-write.js";
 import { deriveSkillSubjectId } from "./skill-subject.js";
@@ -298,6 +298,8 @@ export class FeedMemories extends Resource {
     // resources/originator-instance.ts.
     await applyOriginatorInstanceId(record, priorById);
     applyFederationBookkeeping(record, priorById);
+    const expiryError = stampEphemeralExpiry(record, priorById);
+    if (expiryError) return Response.json({ error: "invalid_expiry", message: expiryError }, { status: 400 });
     await (databases as any).flair.Memory.put(record);
     // flair#1357 — raw-table write: hook it explicitly (see bm25-index-service).
     noteMemoryUpsert(record);
