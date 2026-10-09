@@ -20,6 +20,7 @@ export type TxnPausePoint =
   | "supersede-close"
   | "embedding-stamp-content-suffix"
   | "integration-row-write"
+  | "soul-patch"
   // flair#2275 — MemoryMaintenance. Each action has a `-pre` point (after the
   // scan read, before the owned transaction opens) and an in-transaction point
   // (between that transaction's re-read and its act), so both interleavings of
