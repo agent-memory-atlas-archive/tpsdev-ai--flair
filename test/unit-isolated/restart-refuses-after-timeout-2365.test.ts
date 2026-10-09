@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { atomicSignalWriterSource } from "../helpers/atomic-signal-source.ts";
 import * as childProcess from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -57,12 +58,13 @@ describe("flair#2365 — restart and the stop leg's exit wait", () => {
     const pidfile = join(dataDir, "hdb.pid");
     writeFileSync(script, harperHandler ? String.raw`
 const fs = require('node:fs');
+${atomicSignalWriterSource}
 const path = require('node:path');
 const env = require(path.join(process.env.HARPER_TEST_ROOT, 'utility/environment/environmentManager.js'));
 const run = require(path.join(process.env.HARPER_TEST_ROOT, 'bin/run.js'));
 env.setProperty('ROOTPATH', process.env.ROOTPATH);
 run.addExitListeners();
-process.exit = () => fs.writeFileSync(process.env.REMOVED, String(!fs.existsSync(process.env.PIDFILE)));
+process.exit = () => publishSignal(process.env.REMOVED, String(!fs.existsSync(process.env.PIDFILE)));
 process.stdout.write('ready\n');
 setInterval(() => {}, 1000);
 ` : String.raw`process.on('SIGTERM', () => {}); process.stdout.write('ready\n'); setInterval(() => {}, 1000);`);
