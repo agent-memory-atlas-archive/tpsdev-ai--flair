@@ -109,9 +109,76 @@ echo "[3/3] flair doctor --agent $AGENT_ID --port $PORT (hard semantic gate)"
 DOCTOR_OUTPUT=$(flair doctor --agent "$AGENT_ID" --port "$PORT" 2>&1) || {
   echo "$DOCTOR_OUTPUT"
   echo ""
-  echo "FAIL: flair doctor exited non-zero — semantic search is DEGRADED on a"
-  echo "      realistic non-root sudo-install. The embeddings model could not be"
-  echo "      written/loaded (the #538 showstopper class). Recall-by-meaning is dead."
+  # The #538 showstopper is named only when doctor prints `Semantic search DEGRADED`; every other failing line, including other embeddings failures, is listed as doctor printed it.
+  node --input-type=module - "$DOCTOR_OUTPUT" <<'DOCTORFAIL'
+const raw = process.argv[2] ?? "";
+
+// Doctor colours its icons on a TTY; strip SGR so a coloured capture parses
+// the same as a plain one.
+const output = raw.replace(/\u001b\[[0-9;]*m/g, "");
+const lines = output.split(/\r?\n/);
+
+// Each issue doctor counts is printed with a red ✗; a counted check can also be
+// printed as a ⚠ warning (both carry a Fix/continuation block). Doctor's own
+// summary line ("✗ N issues found …") is a count, so it is read as N below and
+// not listed as a check.
+const isSummary = (s) => /^✗ \d+ issues? found\b/.test(s);
+const findings = [];
+for (let i = 0; i < lines.length; i++) {
+  const line = lines[i];
+  const trimmed = line.trimStart();
+  const isHard = trimmed.startsWith("✗");
+  const isWarn = trimmed.startsWith("⚠");
+  if ((!isHard && !isWarn) || (isHard && isSummary(trimmed))) continue;
+  const indent = line.length - trimmed.length;
+  const block = [line];
+  for (let j = i + 1; j < lines.length; j++) {
+    const next = lines[j];
+    if (next.trim() === "") break;
+    if (next.length - next.trimStart().length <= indent) break;
+    block.push(next);
+  }
+  findings.push({ hard: isHard, lines: block });
+  i += block.length - 1;
+}
+
+// N comes from doctor's own summary line.
+let count = null;
+for (const line of lines) {
+  const trimmed = line.trimStart();
+  if (isSummary(trimmed)) count = Number(trimmed.match(/\d+/)[0]);
+}
+const hard = findings.filter((f) => f.hard);
+
+const out = [];
+out.push(
+  count !== null && count > 0
+    ? `FAIL: flair doctor exited non-zero. doctor reported ${count} issue${count === 1 ? "" : "s"}:`
+    : "FAIL: flair doctor exited non-zero. doctor reported issues but printed no countable summary:",
+);
+
+// The ✗ findings are the counted issues when their number matches N. When it
+// does not, a ⚠ finding also counted and doctor's output does not say which —
+// list every finding line rather than assert which one it was.
+const attributed = count !== null && count > 0 && hard.length === count;
+const shown = attributed ? hard : findings;
+if (shown.length > 0) {
+  for (const f of shown) for (const line of f.lines) out.push(line);
+} else {
+  // No finding lines to show. Reprint doctor's own non-ok lines rather than
+  // assert a cause.
+  const seen = lines.filter((l) => l.trim() !== "" && !/^[✓ℹ]/.test(l.trimStart()));
+  for (const line of seen.length > 0 ? seen : lines.filter((l) => l.trim() !== "")) out.push(line);
+}
+
+if (hard.some((f) => f.lines.some((l) => /Semantic search DEGRADED/.test(l)))) {
+  out.push("      The embeddings check itself failed on a realistic non-root sudo-install:");
+  out.push("      semantic search is DEGRADED and recall-by-meaning is not working. The #538");
+  out.push("      showstopper (the embeddings model not written/loaded) is the common cause.");
+}
+
+process.stdout.write(out.join("\n") + "\n");
+DOCTORFAIL
   exit 1
 }
 echo "$DOCTOR_OUTPUT"
