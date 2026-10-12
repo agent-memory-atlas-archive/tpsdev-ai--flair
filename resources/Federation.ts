@@ -29,7 +29,7 @@ import { stripInboundMemoryRow, stripServerStampedFields } from "./memory-declar
 import { noteWriteStamp } from "./embedding-space-guard.js";
 import { initFederationCleanup } from "./federation-cleanup.js";
 import { verifyFederationRequestBody } from "./replay-store.js";
-import { writeBackCommittedRow, WriteBackConflictError } from "./write-back.js";
+import { CommittedRowChanged, confirmCommittedRow, writeBackCommittedRow, WriteBackConflictError } from "./write-back.js";
 import { withKeyLock } from "./key-lock.js";
 import { withOwnedTransaction } from "./request-transaction.js";
 import { txnPausePoint } from "./txn-pause-point.js";
@@ -479,6 +479,18 @@ export class FederationInstance extends Resource {
  * token; without one it is refused (401, a pairing token is required). On the
  * token path the owned transaction's first read is its token read, so these
  * re-read checks cover a change committed before that read, not after it.
+ *
+ * A first-time pair (no Peer row at the pre-transaction read) stages its token
+ * consume and its Peer write in one owned transaction, then confirms against
+ * committed state that the Peer row is still absent before that transaction
+ * commits. If that confirm read finds a row for the instance in committed state
+ * although the pre-transaction read returned none, the pair is refused (409
+ * peer_row_appeared): the transaction aborts, so this request writes no Peer row
+ * and the token stays unconsumed. The confirm reports only a row present when it
+ * runs, not when that row was committed; it also detects a row committed after
+ * the transaction's token read, if that row is still present. Harper has no
+ * compare-and-set on a table write, so a row committed after the confirm read
+ * and before the commit is not seen by it.
  */
 export class FederationPair extends Resource {
   // Pairing is a public endpoint by design — spokes have no Harper credentials
@@ -731,14 +743,41 @@ export class FederationPair extends Resource {
       // transaction re-reads the token from committed state and commits the
       // consume and the Peer write while the lock is held.
       const ctx = (this as any).getContext?.() ?? {};
-      const refusal = await withPairingTokenClaim(pairingToken, () =>
-        withOwnedTransaction(ctx, async (owned) => {
-          const claim = await consumePairingToken(pairingToken, instanceId, owned);
-          if (claim.kind !== "consumed") return claim;
-          await (databases as any).flair.Peer.put(firstPairPeerRow(instanceId, publicKey, role, endpoint), owned);
-          return claim;
-        }),
-      );
+      // Test-only: inert unless the fault-injection env opt-in is set and armed.
+      // Pause AFTER the pre-transaction read of the Peer row and BEFORE the owned
+      // transaction, so a competing pair or revoke for this instance commits in
+      // between (flair#2512).
+      const firstPairPause = txnPausePoint("federation-pair-first-pre");
+      if (firstPairPause) await firstPairPause;
+      let refusal: Response | undefined;
+      try {
+        refusal = await withPairingTokenClaim(pairingToken, () =>
+          withOwnedTransaction(ctx, async (owned) => {
+            const claim = await consumePairingToken(pairingToken, instanceId, owned);
+            if (claim.kind !== "consumed") return claim;
+            await (databases as any).flair.Peer.put(firstPairPeerRow(instanceId, publicKey, role, endpoint), owned);
+            // The pre-transaction read above returned no Peer row, and this first
+            // pair has now staged one. Confirm against COMMITTED state that the row
+            // is still absent (confirmCommittedRow, resources/write-back.ts): its
+            // read is an explicit fresh context, so it sees the Peer row present in
+            // committed state when it runs, including one committed after this
+            // transaction's token read (which pins this transaction's own read
+            // snapshot). It reports presence, not when the row was committed, and a
+            // row deleted again before it runs is not seen. A row there is not the
+            // one this request staged, so the request must not answer `paired` for
+            // it: the throw aborts the owned transaction, the staged consume and
+            // Peer write are discarded, and the caller answers a named refusal with
+            // the token left unconsumed. A change committed after this confirm read
+            // and before the commit is not seen by it: Harper has no compare-and-set
+            // on a table write.
+            await confirmCommittedRow((databases as any).flair.Peer, instanceId, (committed) => committed == null);
+            return claim;
+          }),
+        );
+      } catch (err) {
+        if (err instanceof CommittedRowChanged) return firstPairRowAppearedRefusal();
+        throw err;
+      }
       if (refusal) return refusal;
 
       // Test-only: inert unless the fault-injection env opt-in is set and armed.
@@ -839,6 +878,21 @@ function peerRevokedRefusal(): Response {
     error: "peer_revoked",
     message: "this Peer row is revoked; it stays revoked",
   }), { status: 403, headers: { "content-type": "application/json" } });
+}
+
+/**
+ * 409 for a first-time pair whose committed-state confirm found a Peer row for
+ * the instance although its pre-transaction read returned none. The owned
+ * transaction aborted: this request wrote no Peer row and did not consume the
+ * pairing token.
+ * Signature verification recorded the request's replay nonce before pairing
+ * began; that record stays.
+ */
+function firstPairRowAppearedRefusal(): Response {
+  return new Response(JSON.stringify({
+    error: "peer_row_appeared",
+    message: "a Peer row for this instance is present in committed state although this pairing's earlier read found none; this request wrote no Peer row and did not consume the pairing token",
+  }), { status: 409, headers: { "content-type": "application/json" } });
 }
 
 /**
