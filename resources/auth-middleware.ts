@@ -1,4 +1,4 @@
-import { writeBackCommittedRow } from "./write-back.js";
+import { WRITE_BACK_ATTEMPTS, WriteBackConflictError, writeBackCommittedRow } from "./write-back.js";
 import { txnPausePoint } from "./txn-pause-point.js";
 import { server, databases } from "harper";
 import { getEmbedding } from "./embeddings-provider.js";
@@ -178,21 +178,48 @@ function getAdminPass(): string | null {
 
 async function backfillEmbedding(memoryId: string): Promise<void> {
   try {
-    const outcome = await writeBackCommittedRow(
-      (databases as any).flair.Memory,
-      memoryId,
-      async (record: any) => {
-        if (!record?.content) return { skip: true };
-        if (record.embedding?.length > 100) return { skip: true };
-        const embedding = await getEmbedding(record.content, "document");
-        if (!embedding) return { skip: true };
-        // Only `embedding`: an incremental update, never a
-        // full-row put of the row read above (flair#2470).
-        return { update: { embedding } };
-      },
-      { label: "backfillEmbedding", pausePre: () => txnPausePoint("backfill-embedding-pre"), pausePoint: () => txnPausePoint("backfill-embedding") },
-    );
-    if ("update" in outcome) console.log(`[auto-embed] ${memoryId}: ${(outcome.update.embedding as number[]).length}d`);
+    const table = (databases as any).flair.Memory;
+    // flair#2484: compute the vector before the owned write transaction opens.
+    // Rows without content or with an embedding longer than 100 entries skip
+    // before content comparison. For eligible rows, `matchFields` compares
+    // content before staging; the helper confirms the committed row afterward.
+    // Drift observed by either check aborts the attempt; remaining outer
+    // attempts re-read and may recompute. Changes after confirmation and before
+    // commit are not detected by these checks.
+    for (let attempt = 1; attempt <= WRITE_BACK_ATTEMPTS; attempt++) {
+      const record = await table.get(memoryId, {});
+      if (!record?.content) return;
+      if (record.embedding?.length > 100) return;
+      const text = record.content;
+      const embedding = await getEmbedding(text, "document");
+      if (!embedding) return;
+      try {
+        const outcome = await writeBackCommittedRow(
+          table,
+          memoryId,
+          (row: any) => {
+            if (!row?.content) return { skip: true };
+            if (row.embedding?.length > 100) return { skip: true };
+            // Only `embedding`: an incremental update, never a
+            // full-row put of the row read above (flair#2470).
+            return { update: { embedding } };
+          },
+          {
+            label: "backfillEmbedding",
+            expectedRow: record,
+            // Compare content before staging, after the plan's skip checks.
+            matchFields: ["content"],
+            pausePre: () => txnPausePoint("backfill-embedding-pre"),
+            pausePoint: () => txnPausePoint("backfill-embedding"),
+          },
+        );
+        if ("update" in outcome) console.log(`[auto-embed] ${memoryId}: ${(outcome.update.embedding as number[]).length}d`);
+        return;
+      } catch (err) {
+        if (err instanceof WriteBackConflictError && attempt < WRITE_BACK_ATTEMPTS) continue;
+        throw err;
+      }
+    }
   } catch (err: any) {
     console.error(`[auto-embed] Failed for ${memoryId}: ${err.message}`);
   }
