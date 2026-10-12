@@ -1275,6 +1275,26 @@ function readOpsPortFromConfig(path: string = configPath()): number | null {
 }
 
 /**
+ * The HTTP value treated as NAMED: a `--port` value accepted by the existing
+ * resolver, else the first `:digits` match in `FLAIR_URL` converted to a number;
+ * null when neither supplies one. These are the first two rungs of
+ * `resolveHttpPort`, which reads them through this function, so
+ * `resolveAgentHomeTarget` and `resolveHttpPort` agree on what was named.
+ */
+function namedHttpPort(opts: { port?: string | number }): number | null {
+  if (opts.port !== undefined && opts.port !== null) {
+    const n = Number(opts.port);
+    if (!isNaN(n) && n > 0) return n;
+  }
+  const envUrl = process.env.FLAIR_URL;
+  if (envUrl) {
+    const m = envUrl.match(/:(\d+)/);
+    if (m) return Number(m[1]);
+  }
+  return null;
+}
+
+/**
  * Unified port resolution: `--port` flag > `FLAIR_URL` env > Harper's own config
  * in the instance's data directory > (default install only) the per-user config
  * > default.
@@ -1313,15 +1333,8 @@ function readOpsPortFromConfig(path: string = configPath()): number | null {
  * it is for the default install that has always relied on it.
  */
 function resolveHttpPort(opts: { port?: string | number; dataDir?: string }, mode: "address" | "create" = "address"): number {
-  if (opts.port !== undefined && opts.port !== null) {
-    const n = Number(opts.port);
-    if (!isNaN(n) && n > 0) return n;
-  }
-  const envUrl = process.env.FLAIR_URL;
-  if (envUrl) {
-    const m = envUrl.match(/:(\d+)/);
-    if (m) return Number(m[1]);
-  }
+  const named = namedHttpPort(opts);
+  if (named !== null) return named;
 
   const dataDir = instanceDataDir(opts);
 
@@ -1543,6 +1556,122 @@ function resolveOpsPort(opts: { opsPort?: string | number; port?: string | numbe
   } catch { /* ignore */ }
   // Default: httpPort - 1
   return resolveHttpPort(opts) - 1;
+}
+
+/** The named refusal for a configured-pair conflict or an unpaired one-sided target (flair#2474). */
+export const AMBIGUOUS_INSTANCE_TARGET_ERROR = "ambiguous_instance_target";
+
+/** Inputs to {@link decideAgentHomeTarget}. */
+export interface AgentHomeTargetInputs {
+  /** The HTTP port `resolveHttpPort` resolved. */
+  httpPort: number;
+  /** Whether the caller NAMED that HTTP port (`--port` or `FLAIR_URL`), rather than it being derived. */
+  httpNamed: boolean;
+  /** The ops port the caller NAMED (`--ops-port` or `FLAIR_OPS_PORT`), or null. */
+  namedOps: number | null;
+  /** The HTTP port resolved from config, or null. */
+  configuredHttp: number | null;
+  /** The ops port resolved from config, or null. */
+  configuredOps: number | null;
+  /** The ops port the ordinary ladder (`resolveOpsPort`) derives; used only when neither port is named and the config records no complete pair. */
+  deriveOps: () => number;
+}
+
+/**
+ * The pairing rule of {@link resolveAgentHomeTarget} (flair#2474).
+ * With a COMPLETE configured pair (both ports recorded):
+ *   - an ops port that is not named is the pair's ops port;
+ *   - if exactly ONE of the two ports equals its side of the pair, the target is
+ *     REFUSED: the target conflicts with the configured pair;
+ *   - if both equal the pair, the pair is used; if NEITHER does, the ports are
+ *     used as given (from resolveAgentHomeTarget that happens only when the
+ *     caller named both, since a port it does not name is the pair's).
+ *
+ * With NO complete configured pair resolved (one side or both null):
+ *   - exactly one port named is REFUSED: its counterpart cannot be established
+ *     from a configured pair, so the two could address different instances;
+ *   - both named: used as given;
+ *   - neither named: the HTTP port as resolved and the ops port from `deriveOps`.
+ *
+ * Ports used "as given" are NOT VERIFIED: nothing here contacts an instance to
+ * confirm that two named ports belong to one instance.
+ */
+export function decideAgentHomeTarget(i: AgentHomeTargetInputs): { httpPort: number; opsPort: number } {
+  const { httpPort, httpNamed, namedOps, configuredHttp, configuredOps } = i;
+  const remedy = "Pass both ports (--port and --ops-port) for one instance.";
+  if (configuredHttp !== null && configuredOps !== null) {
+    const opsPort = namedOps ?? configuredOps;
+    const httpMatches = httpPort === configuredHttp;
+    const opsMatches = opsPort === configuredOps;
+    if (httpMatches !== opsMatches) {
+      throw new Error(
+        `${AMBIGUOUS_INSTANCE_TARGET_ERROR}: the target (HTTP port ${httpPort}, ops port ${opsPort}) conflicts with the configured pair — `
+          + `the config pairs HTTP ${configuredHttp} with ops ${configuredOps}. ${remedy}`,
+      );
+    }
+    return { httpPort, opsPort };
+  }
+  const opsNamed = namedOps !== null;
+  if (httpNamed !== opsNamed) {
+    const [named, namedPort, other] = httpNamed ? ["HTTP", httpPort, "ops"] : ["ops", namedOps, "HTTP"];
+    throw new Error(
+      `${AMBIGUOUS_INSTANCE_TARGET_ERROR}: only the ${named} port (${namedPort}) was named, and no complete port pair could be resolved from config `
+        + `(HTTP ${configuredHttp ?? "none"}, ops ${configuredOps ?? "none"}) to take the ${other} port from, so the two ports could address different instances. ${remedy}`,
+    );
+  }
+  if (namedOps !== null) return { httpPort, opsPort: namedOps };
+  return { httpPort, opsPort: i.deriveOps() };
+}
+
+/**
+ * The ports `flair agent stamp-home` and `flair principal add` address
+ * (flair#2474). Each command talks to an ops API (stamp-home's roster read and
+ * read-backs; principal add's stored-home reads and its insert) AND sends its
+ * guarded PATCH to the Agent resource on the HTTP port. Resolving the two
+ * INDEPENDENTLY — `resolveOpsPort(opts)` and `resolveHttpPort(opts)` — let
+ * `--ops-port` name one instance and `--port` another, so the read landed on the
+ * first and the write on the second.
+ *
+ * The configured pair is what the instance's config records: Harper's config in
+ * its data directory records `http.port` and `operationsApi.network.port`; for
+ * the default install, `~/.flair/config.yaml`'s `port`/`opsPort` supplies a side
+ * Harper's config does not record. The pairing rule is
+ * {@link decideAgentHomeTarget}: a port that matches its side of a COMPLETE
+ * configured pair binds the other to that pair; a target with only ONE port
+ * named is refused when no complete configured pair is resolved; two ports the
+ * caller names that match neither side of a complete pair (or any two named
+ * ports when there is no complete pair) are used as given, without
+ * verification. Every refusal is `ambiguous_instance_target`.
+ */
+export function resolveAgentHomeTarget(opts: { port?: string | number; opsPort?: string | number; dataDir?: string }): {
+  httpPort: number;
+  opsPort: number;
+} {
+  const httpPort = resolveHttpPort(opts);
+  const dataDir = instanceDataDir(opts);
+  const fromHarper = harperPortValue(readHarperConfig(dataDir)?.operationsApi?.network?.port);
+  const configuredOps = fromHarper ?? (isDefaultDataDir(dataDir) ? readOpsPortFromConfig() : null);
+  const configuredHttp = readPortFromHarperConfig(dataDir) ?? (isDefaultDataDir(dataDir) ? readPortFromConfig() : null);
+  let namedOps: number | null = null;
+  if (opts.opsPort !== undefined && opts.opsPort !== null) {
+    const n = Number(opts.opsPort);
+    if (!(Number.isInteger(n) && n >= 1 && n <= 65535)) {
+      // An invalid --ops-port is refused by resolveOpsPort, which exits.
+      return { httpPort, opsPort: resolveOpsPort(opts) };
+    }
+    namedOps = n;
+  } else if (process.env.FLAIR_OPS_PORT) {
+    const n = Number(process.env.FLAIR_OPS_PORT);
+    namedOps = Number.isInteger(n) && n >= 1 && n <= 65535 ? n : null;
+  }
+  return decideAgentHomeTarget({
+    httpPort,
+    httpNamed: namedHttpPort(opts) !== null,
+    namedOps,
+    configuredHttp,
+    configuredOps,
+    deriveOps: () => resolveOpsPort(opts),
+  });
 }
 
 // Ops API bind-host resolution (flair#670, #863): --ops-bind flag >
@@ -4736,6 +4865,7 @@ bindAgentCli({
   shouldShowInlineSecretWarning,
   resolveHttpPort,
   resolveOpsPort,
+  resolveAgentHomeTarget,
   resolveEffectiveOpsUrl,
   seedAgentViaOpsApi,
   seedAgentWithLocalHome,
@@ -4787,6 +4917,8 @@ bindPrincipalCli({
   pubKeyPath,
   relativeTime,
   resolveOpsPort,
+  resolveHttpPort,
+  resolveAgentHomeTarget,
 });
 registerPrincipal(program);
 
