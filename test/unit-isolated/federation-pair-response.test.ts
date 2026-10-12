@@ -53,6 +53,13 @@ const databasesMock = {
         tokens.set(String(row.id), { ...row });
         return row;
       },
+      // The per-token lock (resources/key-lock.ts) the pairing claim runs
+      // under (flair#2333); a real Harper table exposes it as `primaryStore`.
+      primaryStore: {
+        tryLock: () => true,
+        unlock: () => {},
+        resetReadTxn: () => {},
+      },
     },
     // Signed federation bodies record their nonce here (flair#2061).
     ReplayNonce: createFakeReplayNonceTable(),
@@ -195,7 +202,7 @@ describe("FederationPair.post — several Instance rows refuse BEFORE the token,
       expect(log).toContain(ROW_A.id);
       expect(log).toContain(ROW_B.id);
 
-      // The check ran FIRST: the one-time token is still usable...
+      // The check ran FIRST: the one-time token is unconsumed and retryable while valid...
       expect(tokens.get(token)?.consumedBy).toBeUndefined();
       expect(tokens.get(token)?.consumedAt).toBeUndefined();
       // ...and no peer was recorded from a pairing that did not happen.
@@ -204,7 +211,7 @@ describe("FederationPair.post — several Instance rows refuse BEFORE the token,
   }
 
   it("refuses a RE-PAIR the same way, leaving the existing peer row untouched", async () => {
-    // A re-pair needs no token and WRITES the existing peer row (endpoint/status)
+    // An otherwise valid, non-revoked re-pair needs no token and updates the Peer row.
     // — so the refusal has to come before that write too.
     instanceRows = [ROW_A, ROW_B];
     const instanceId = "flair_spoke_already_paired";
