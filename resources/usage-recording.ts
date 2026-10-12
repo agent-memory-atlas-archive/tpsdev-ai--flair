@@ -116,11 +116,10 @@ export class UsageLedgerReadError extends Error {
  *
  * The count bump is the shared write-back helper (write-back.ts): the row is
  * read inside a transaction this call OWNS, the bump is built from THAT read,
- * and the committed row is re-read before commit. A row deleted or purged
- * between the read and the write is not bumped and NOT re-created (the plan
- * skips an absent row). A same-id replace is refused, never overwritten: an
- * identity change the in-transaction read already sees throws
- * WriteBackConflictError at once (no retry). Only a change to the committed
+ * and the committed row is re-read before commit. The plan skips an absent
+ * row or one outside the agent's read scope before any identity comparison.
+ * For a row the plan does not skip, an identity change the in-transaction read
+ * already sees throws WriteBackConflictError at once (no retry). Only a change to the committed
  * row found by the re-read after the bump is staged retries, from a fresh
  * read, at most WRITE_BACK_ATTEMPTS attempts in all (then
  * WriteBackConflictError). recordUsageBatch / recordCitations log either
@@ -232,8 +231,10 @@ async function recordUsageContributionLocked(
   // count (RecordUsage.ts module doc's "WHY THIS IS ITS OWN ENDPOINT"). The helper
   // confirms, inside its own transaction, that the stored row is still the one
   // this contribution was checked against (flair#2441): a row deleted or purged
-  // after the read is not re-created (the plan skips an absent row), a same-id
-  // replace is refused, and a row in a scope that no longer reads is skipped.
+  // before the in-transaction read is skipped by the plan (absent row), as is a
+  // row outside the agent's read scope; for any other row an identity mismatch
+  // seen by the check is refused. An error from the transactional read is not
+  // caught here: it propagates to the caller.
   await writeBackCommittedRow(
     (databases as any).flair.Memory,
     memoryId,

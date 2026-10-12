@@ -37,8 +37,8 @@ add("MemoryArchive", ["writer:Memory.put#1"], "GUARDED: Memory.put().");
 add("Memory", [
   "writer:cls.create#1", "writer:(databases as any).flair.Memory.post#1",
   "writer:(databases as any).flair.Memory.put#2",
+  "writer:(databases as any).flair.Memory.put#3",
   "writer:(databases as any).flair.Memory.update#1",
-  "writer:super.put#1",
   "writer:super.patch#1",
   "writer:(databases as any).flair.Memory.delete#1",
 ], "GUARDED: Memory.post/put/patch/delete call the decision on the URL and body ids first (the put _reindex branch included).");
@@ -49,9 +49,7 @@ add("MemoryFeed", ["alias-source:(databases as any).flair.Memory#1", "writer:wri
 add("MemoryFeed", ["writer:(databases as any).flair.Memory.update#1"],
   "GUARDED: the dedup expiry repair (flair#2358) calls the decision on the id it writes before the incremental update (flair#2470).");
 add("Federation", ["writer:writeBackCommittedRow#1"],
-  "GUARDED: the merge skips a reserved id (seed_id_not_federated) before the write-back through the shared helper.");
-add("Federation", ["writer:table.put#1"],
-  "GUARDED: the merge of every other synced table (flair#2441 keeps Memory on the write-back) follows the same seed_id_not_federated skip.");
+  "GUARDED: the merge of every synced table skips a reserved id (seed_id_not_federated) before the write-back through the shared helper (flair#2450).");
 add("skill-version-write", ["writer:(databases as any).flair.Memory.put#1", "writer:(databases as any).flair.Memory.put#2"],
   "GUARDED: the transactional skill writer (flair#2139 S2) is reached only after Memory.post/put/delete or FeedMemories ran the reserved-id decision on the write's ids; the successor upsert and predecessor close ride the same transaction.");
 add("skill-version-write", ["alias-source:(databases as any).flair?.Memory#1"],
@@ -112,9 +110,10 @@ for (const [file, alias] of [
   ["Memory", "alias-source:(databases as any).flair.Memory#1"],
   ["Memory", "alias-source:(databases as any).flair.Memory#2"],
   ["Memory", "alias-source:(databases as any).flair.Memory#3"],
-  // flair#2465/#2441: the two committed-row re-checks (confirmCommittedRow takes only `get`) —
-  // the re-embed's and Memory.put's.
+  // The committed-row re-checks (confirmCommittedRow takes only `get`): #2 the
+  // re-embed's (flair#2465), #4 the _reindex re-PUT's (flair#2450), #5 Memory.put's (flair#2441).
   ["Memory", "alias-source:(databases as any).flair.Memory#4"],
+  ["Memory", "alias-source:(databases as any).flair.Memory#5"],
   ["AdminMemory", "alias-source:(databases as any).flair.Memory#1"],
   ["Federation", "alias-source:(databases as any).flair.Memory#1"],
   ["MemoryReflect", "alias-source:(databases as any).flair.Memory#1"],
@@ -200,9 +199,10 @@ test("the listed entry paths run the decision, and its denial stops the path bef
     const body = methodBody(memory, signature);
     expect(body, `${signature} does not validate supersedes`).toContain("validateAndAuthorizeSupersedes(content, auth, ctx,");
     // The _reindex branch of put() writes earlier but never reaches a supersede;
-    // the new-row write and the close must come after the denial returns.
+    // the new-row write (`.flair.Memory.put(content, c)`, not the reindex
+    // `put(reindexRow, c)`) and the close must come after the denial returns.
     expectWritesAfter(body, denialReturnEnd(body, "validateAndAuthorizeSupersedes", "denial"), `${signature} supersedes`,
-      ["writeMemoryRowPost(", ".flair.Memory.put(", "closeSupersededIfNeeded("]);
+      ["writeMemoryRowPost(", ".flair.Memory.put(content, c)", "closeSupersededIfNeeded("]);
   }
 
   const feed = readFileSync("resources/MemoryFeed.ts", "utf8");
@@ -213,7 +213,6 @@ test("the listed entry paths run the decision, and its denial stops the path bef
   const skip = skipContinueEnd(federation, "seed_id_not_federated");
   expect(skip, "the seed skip does not stop the record").toBeGreaterThan(-1);
   expect(federation.indexOf("await writeBackCommittedRow(", skip)).toBeGreaterThan(skip);
-  expect(federation.indexOf("await table.put(mergedData)", skip)).toBeGreaterThan(skip);
 });
 
 test("the listed entry paths run the .content-suffix id decision on the ids it writes, and its denial stops the path before it writes", () => {

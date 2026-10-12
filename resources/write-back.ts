@@ -33,6 +33,16 @@ export interface WriteBackOptions {
   expectedRow?: any;
   matches?: (row: any) => boolean;
   matchFields?: string[];
+  /**
+   * Before a planned write, require the in-transaction row to equal the selected
+   * basis (`expectedRow` when supplied) as a WHOLE row, not only in the fields
+   * {@link sameStoredRow} compares. Soul, Agent and Relationship have no
+   * instanceToken or contentHash; Message has contentHash but no instanceToken
+   * or agentId. Message's hash excludes mutable lifecycle fields, so an
+   * identity check alone misses their changes (flair#2450).
+   * The comparison spreads `row` to match the plain `{ ...selected }` basis.
+   */
+  wholeRow?: boolean;
   /** Test-only pause BEFORE this call's owned transaction opens — the
    *  interleaving where the other writer's transaction opens first. The call
    *  site names its point: `() => txnPausePoint("<name>")` (flair#2382). */
@@ -51,8 +61,7 @@ export const WRITE_BACK_IDENTITY_FIELDS = ["id", "agentId", "instanceToken", "co
  * Is `row` still the stored row `basis` describes? Compares the fields in
  * {@link WRITE_BACK_IDENTITY_FIELDS} — the row's id and agent, and the
  * server-stamped incarnation token, content hash and creation time. A `basis`
- * of `null` requires `row` to still be absent (a write-back never re-creates a
- * row a delete or a purge removed).
+ * of `null` requires `row` to still be absent.
  *
  * This is the identity check the write-back helper applies, exposed so a
  * writer that cannot hand its write to the helper (one that joins a
@@ -173,9 +182,13 @@ export async function writeBackCommittedRow(
   const attempts = opts.attempts ?? WRITE_BACK_ATTEMPTS;
   const selected = "expectedRow" in opts ? opts.expectedRow : await table.get(id, {});
   const basis = selected == null ? selected : { ...selected };
-  const sameTarget = (row: any) => row == null ? basis == null :
-    basis != null && sameStoredRow(row, basis) &&
-    (opts.matchFields ?? []).every((field) => isDeepStrictEqual(row[field], basis[field]));
+  const sameTarget = (row: any) => {
+    if (row == null) return basis == null;
+    if (basis == null) return false;
+    return sameStoredRow(row, basis) &&
+      (!opts.wholeRow || isDeepStrictEqual({ ...row }, basis)) &&
+      (opts.matchFields ?? []).every((field) => isDeepStrictEqual(row[field], basis[field]));
+  };
   if (opts.pausePre) {
     const pre = opts.pausePre();
     if (pre) await pre;

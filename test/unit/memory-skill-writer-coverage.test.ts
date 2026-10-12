@@ -34,7 +34,7 @@ const add = (file: string, sites: string[], reason: string) => {
 
 // ── GATED skill-writer sinks (run SkillScan + forced durability) ──
 add("MemoryArchive", ["writer:Memory.put#1"], "Guarded by Memory.put().");
-add("Memory", ["writer:cls.create#1", "writer:(databases as any).flair.Memory.post#1", "writer:(databases as any).flair.Memory.put#2"],
+add("Memory", ["writer:cls.create#1", "writer:(databases as any).flair.Memory.post#1", "writer:(databases as any).flair.Memory.put#3"],
   "Skill-writer: routes through the SkillScan gate + forced durability in Memory.post()/put() (flair#1542).");
 add("skill-version-write", ["writer:(databases as any).flair.Memory.put#1"],
   "Memory post/put and FeedMemories scan the merged successor body before calling this writer.");
@@ -47,9 +47,7 @@ add("AgentSeed", ["writer:(databases as any).flair.Memory.put#1"],
 
 // ── SKIPPING skill-writer sinks (skill_not_federated) ──
 add("Federation", ["writer:writeBackCommittedRow#1"],
-  "Skill-writer: SKIPS skill-tagged rows (skill_not_federated) — skills are local, never synced (flair#1542).");
-add("Federation", ["writer:table.put#1"],
-  "Not a Memory writer: the merge of every OTHER synced table, the `else` of `record.table === \"Memory\"` (flair#2441); a Memory merge is the write-back above, after the skill_not_federated skip.");
+  "Skill-writer: SKIPS skill-tagged rows (skill_not_federated) — skills are local, never synced (flair#1542); every synced table's merge is the write-back above.");
 
 // ── Existing-row writes preserving content and tags ──
 add("MemoryFeed", ["writer:(databases as any).flair.Memory.update#1"],
@@ -58,7 +56,7 @@ add("skill-version-write", ["writer:(databases as any).flair.Memory.put#2"],
   "Skill predecessor close: preserves stored content and tags.");
 add("Memory", ["writer:(databases as any).flair.Memory.update#1"],
   "Re-embed request (flair#2465): an incremental update of only embedding/embeddingModel/updatedAt for a locally computed vector; it does not carry the re-read row's other fields.");
-add("Memory", ["writer:super.put#1"],
+add("Memory", ["writer:(databases as any).flair.Memory.put#2"],
   "Admin-only _reindex re-PUT (reindex_admin_only gate) — preserves existing content and tags.");
 add("Memory", ["writer:(databases as any).flair.Memory.put#1"],
   "closeSupersededRecord: read-modify-write close of an existing record (stamps validTo), preserves existing content/tags — not a new skill write.");
@@ -67,8 +65,8 @@ add("Memory", ["writer:patchRecord#1"],
   "derivedFrom/lastReflected bookkeeping patch — never writes skill content.");
 add("Memory", ["writer:(databases as any).flair.Memory.delete#1"],
   "Memory.delete(): removal, not a write.");
-add("Memory", ["alias-source:(databases as any).flair.Memory#1", "alias-source:(databases as any).flair.Memory#2", "alias-source:(databases as any).flair.Memory#3", "alias-source:(databases as any).flair.Memory#4"],
-  "Read-only table aliases (the class heritage and two committed-row re-checks; #2 is the re-embed's confirmCommittedRow (flair#2465) and #4 is Memory.put's (flair#2441), which takes only `get`) — no write through these handles.");
+add("Memory", ["alias-source:(databases as any).flair.Memory#1", "alias-source:(databases as any).flair.Memory#2", "alias-source:(databases as any).flair.Memory#3", "alias-source:(databases as any).flair.Memory#4", "alias-source:(databases as any).flair.Memory#5"],
+  "Table handles: #1 is the table handed to patchRecord (that write is classified above as writer:patchRecord#1); the others are read-only — #3 is the class heritage, and #2, #4 and #5 are committed-row re-checks (confirmCommittedRow, which takes only `get`) — #2 the re-embed's (flair#2465), #4 the _reindex re-PUT's (flair#2450) and #5 Memory.put's (flair#2441).");
 
 // ── Non-skill writers in other modules ──
 add("MemoryFeed", ["alias-source:(databases as any).flair.Memory#1", "writer:writeBackCommittedRow#1"],
