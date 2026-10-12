@@ -514,13 +514,35 @@ class MemoryApi {
    * old record is owned by a DIFFERENT agent, the server requires a "write"
    * MemoryGrant from that owner — otherwise it denies the request (cross-agent
    * write).
+   *
+   * flair#2482: ordinary, non-skill, same-ID updates without `hostSource`
+   * preserve the stored pointer row.
    */
-  async update(id: string, content: string, opts: { preserveHistory?: boolean; usedMemoryIds?: string[]; metadata?: Record<string, unknown> } = {}): Promise<Memory> {
+  async update(id: string, content: string, opts: {
+    preserveHistory?: boolean;
+    usedMemoryIds?: string[];
+    metadata?: Record<string, unknown>;
+    /** flair#2482 — the host pointer this update CLAIMS as the memory's source.
+     *  Forwarded only when supplied; see {@link MemoryApi.write} for the shape. */
+    hostSource?: HostSource;
+    /** flair#2482 — opt the pointer into the record's read scope; forwarded only
+     *  when supplied. */
+    hostSourceScope?: "record";
+  } = {}): Promise<Memory> {
     const existing = await this.get(id);
     if (!existing) {
       throw new FlairError("PUT", `/Memory/${encodeRecordId(id)}`, 404, `memory ${id} not found`);
     }
     const metadata = opts.metadata === undefined ? existing.metadata : mergeMetadata(existing.metadata, opts.metadata);
+    // flair#2482 — drop read-projected pointer fields; forward hostSource and
+    // hostSourceScope only when supplied.
+    const applyPointerFields = (record: Record<string, unknown>): void => {
+      delete record.hostSource;
+      delete record.hostSourceScope;
+      delete record.hostSourceVisibility;
+      if (opts.hostSource !== undefined) record.hostSource = { v: 1, ...opts.hostSource };
+      if (opts.hostSourceScope !== undefined) record.hostSourceScope = opts.hostSourceScope;
+    };
 
     if (opts.preserveHistory) {
       const newId = `${this.client.agentId}-${crypto.randomUUID()}`;
@@ -555,6 +577,7 @@ class MemoryApi {
       if (Array.isArray(opts.usedMemoryIds) && opts.usedMemoryIds.length > 0) {
         record.usedMemoryIds = opts.usedMemoryIds;
       }
+      applyPointerFields(record);
       // The Memory schema does not expose a working HTTP POST route (see
       // resources/Memory.ts) — Memory.post() is only reachable in-process
       // (resources/mcp-tools.ts). So the supersede-link write goes through
@@ -579,6 +602,7 @@ class MemoryApi {
     if (Array.isArray(opts.usedMemoryIds) && opts.usedMemoryIds.length > 0) {
       merged.usedMemoryIds = opts.usedMemoryIds;
     }
+    applyPointerFields(merged);
     const response = await this.client.request<Record<string, unknown>>("PUT", `/Memory/${encodeRecordId(id)}`, merged);
     return { ...merged, id, ...(response ?? {}) } as unknown as Memory;
   }
