@@ -8,6 +8,7 @@ import { stampOriginatorOnCreate } from "./originator-instance.js";
 import { invalidAgentIdMessage, isValidAgentId } from "../src/lib/agent-id-rule.js";
 import { withKeyLock } from "./key-lock.js";
 import { withOwnedTransaction } from "./request-transaction.js";
+import { CommittedRowChanged, confirmCommittedRow, sameStoredRow } from "./write-back.js";
 import { txnPausePoint } from "./txn-pause-point.js";
 import { claimIdJagJti, idJagReplayDeps, ReplayStoreUnavailable, reportReplayStoreGapsAtBoot, type ReplayStoreBootStore } from "./replay-store.js";
 
@@ -240,6 +241,16 @@ async function resolveOrCreatePrincipalLocked(
         { attribute: "idpProvider", comparator: "equals", value: idpConfig.id },
       ],
     }, owned)) {
+      // A matched credential whose status is not "active" completes no grant.
+      // `status` is a nullable String on schemas/agent.graphql whose documented
+      // values are "active" and "revoked" (a comment, not an enforced enum); the
+      // revoke path writes "revoked". Refuse it by name: no credential touch and
+      // no OAuth token is written, so its lastUsedAt is left untouched. A present
+      // `jti` is claimed — and consumed — before this status check, in its own
+      // transaction (the claim above, before the owned transaction).
+      if (cred.status !== "active") {
+        throw new Error(`IdP credential for this subject has status "${cred.status}"; the jwt-bearer grant is refused`);
+      }
       // Test-only: valid names are inert unless fault injection is enabled and
       // armed (resources/txn-pause-point.ts). Holds this touch between the read
       // above and the write below — the interleaving a revoke or delete of this
@@ -251,6 +262,34 @@ async function resolveOrCreatePrincipalLocked(
         ...cred,
         lastUsedAt: nowISO(),
       }, owned);
+      // A revoke or a delete committed while this touch was in flight (the
+      // read above through the write above) refuses the grant rather than
+      // being overwritten by the touch: re-read the COMMITTED row and abort
+      // the touch unless it is still this matched, active credential
+      // (resources/write-back.ts, confirmCommittedRow — the same confirmation
+      // the write-back helper runs once its write is staged). A change
+      // committed after this read and before the commit is not seen by it:
+      // Harper has no compare-and-set on a table write, so that sliver is
+      // outside what this grant can guarantee.
+      try {
+        await confirmCommittedRow(
+          (databases as any).flair.Credential,
+          cred.id,
+          (committed) => committed != null && committed.status === "active" &&
+            sameStoredRow(committed, cred) &&
+            committed.principalId === cred.principalId &&
+            committed.kind === cred.kind &&
+            committed.idpSubject === cred.idpSubject &&
+            committed.idpProvider === cred.idpProvider,
+        );
+      } catch (err) {
+        // Aborting this transaction discards the staged touch. Refuse the grant
+        // by name: the credential is gone, revoked, or no longer the one read.
+        if (err instanceof CommittedRowChanged) {
+          throw new Error("the matched IdP credential changed while the grant was in progress; the jwt-bearer grant is refused");
+        }
+        throw err;
+      }
       return cred.principalId;
     }
 
