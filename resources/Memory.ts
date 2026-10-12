@@ -689,6 +689,13 @@ export function buildReindexRow(
 /** Aborts the close's owned transaction: the row changed after the transaction read it. */
 class CloseTargetChanged extends Error {}
 
+/**
+ * Aborts the close's owned transaction: a cross-agent close authorized by a
+ * "write" grant found that grant revoked on committed state before it committed
+ * (flair#2333 H10). This close attempt does not retry.
+ */
+class GrantedCloseRevoked extends Error {}
+
 /** Attempts of the close before it gives up on a row that keeps changing. */
 const SUPERSEDE_CLOSE_ATTEMPTS = 3;
 
@@ -716,8 +723,17 @@ const SUPERSEDE_CLOSE_ATTEMPTS = 3;
  * the committed row: SUPERSEDE_CLOSE_ATTEMPTS (three) attempts in all, so at
  * most two retries. A change committed after that re-read and before the commit is not
  * seen by it; Harper orders the two writes by timestamp.
+ *
+ * flair#2333 (H10): `granteeId` is set for a CROSS-agent close that a "write"
+ * memory grant authorized. The grant is re-checked on committed state inside the
+ * transaction, AFTER the write is staged — the same write-back confirm the target
+ * row gets above, over the same empty-context read. A grant revoked and committed
+ * before that re-check aborts the close (GrantedCloseRevoked, not retried) instead
+ * of letting the grantee close the owner's memory. As with the target-row re-read,
+ * a revocation committed after this re-check and before the transaction commits is
+ * not seen by it; Harper orders the two writes by timestamp.
  */
-async function closeSupersededRecord(ctx: any, oldId: string, patch: Record<string, unknown>, expectedOwner?: string): Promise<void> {
+async function closeSupersededRecord(ctx: any, oldId: string, patch: Record<string, unknown>, expectedOwner?: string, granteeId?: string): Promise<void> {
   for (let attempt = 1; ; attempt++) {
     let closedRow: any;
     try {
@@ -735,8 +751,21 @@ async function closeSupersededRecord(ctx: any, oldId: string, patch: Record<stri
         const closed = { ...existing, ...patch };
         stripUndeclaredMemoryAttributes(closed);
         await (databases as any).flair.Memory.put(closed, c);
+        // Test-only: inert unless armed — here the write is staged, so a
+        // competing write and the committed-state re-reads below can be exercised
+        // in either order.
+        const stagedPause = txnPausePoint("supersede-close-staged");
+        if (stagedPause) await stagedPause;
         const committed = await (databases as any).flair.Memory.get(oldId, {});
         if (!isDeepStrictEqual(committed, existing)) throw new CloseTargetChanged();
+        // flair#2333 (H10): a grant-authorized, non-admin cross-agent close stands
+        // on the grant checked at authorization time. Re-read it on committed state
+        // HERE — after the write is staged, as the last read before this transaction
+        // commits — so a grant revoked and committed before this point aborts the
+        // close; this close attempt does not retry.
+        if (granteeId !== undefined && !(await hasWriteGrant(granteeId, expectedOwner as string, {}))) {
+          throw new GrantedCloseRevoked();
+        }
         return closed;
       });
     } catch (err) {
@@ -780,14 +809,14 @@ async function markDerivedSourcesReflected(content: any): Promise<void> {
  *  the read paths used before the open-within-org reframe (reads no longer
  *  consult MemoryGrant); it survives here for the "write" scope that gates
  *  cross-agent supersede. */
-async function hasWriteGrant(granteeId: string, ownerId: string): Promise<boolean> {
+async function hasWriteGrant(granteeId: string, ownerId: string, ctx?: unknown): Promise<boolean> {
   try {
     for await (const grant of (databases as any).flair.MemoryGrant.search({
       conditions: [
         { attribute: "granteeId", comparator: "equals", value: granteeId },
         { attribute: "ownerId", comparator: "equals", value: ownerId },
       ],
-    })) {
+    }, ctx)) {
       if (grant.scope === "write") return true;
     }
   } catch {
@@ -871,8 +900,13 @@ async function validateAndAuthorizeSupersedes(
     if (stored?.supersedes === content.supersedes) return { denial: null, close: null };
     return refuse(supersedesTargetMissing());
   }
-  if (target.agentId !== auth.agentId && !(await hasWriteGrant(auth.agentId, target.agentId))) {
-    return refuse(FORBIDDEN("forbidden: cannot supersede a memory owned by another agent without a write grant"));
+  if (target.agentId !== auth.agentId) {
+    if (!(await hasWriteGrant(auth.agentId, target.agentId))) {
+      return refuse(FORBIDDEN("forbidden: cannot supersede a memory owned by another agent without a write grant"));
+    }
+    // flair#2333 (H10): the close re-checks this grant against committed state
+    // before it lands, so the grantee id travels with the close plan.
+    return { denial: null, close: { id: content.supersedes, ownerId: target.agentId, granteeId: auth.agentId } };
   }
   return { denial: null, close: { id: content.supersedes, ownerId: target.agentId } };
 }
@@ -882,6 +916,12 @@ interface SupersedeClose {
   id: string;
   /** The owner the authorization read saw (non-admin agent callers only). */
   ownerId?: string;
+  /**
+   * flair#2333 (H10): the grantee whose "write" grant authorized a CROSS-agent
+   * close. Set only when the caller is not the owner, so the close can re-check
+   * the grant against committed state before it lands.
+   */
+  granteeId?: string;
 }
 
 /**
@@ -910,7 +950,7 @@ async function closeSupersededIfNeeded(ctx: any, content: any, close: SupersedeC
     await closeSupersededRecord(ctx, close.id, {
       validTo: content.validFrom ?? content.createdAt,
       updatedAt: content.createdAt ?? content.updatedAt,
-    }, close.ownerId);
+    }, close.ownerId, close.granteeId);
   } catch (err) {
     // Constant format string + structured data: memory ids are agent-controlled,
     // so interpolating them into console.error's format position (with a trailing
