@@ -8,8 +8,8 @@
  */
 import { Command } from "commander";
 import { makeReadInstanceIds } from "./keys.js";
-import { COMPONENT_ENV_FILENAME, PUBLIC_URL_KEY, describePublicUrlFinding, readEnvValue } from "../component-env.js";
-import { readTargetMcpRedirectFinding } from "../lib/mcp-oauth-env.js";
+import { COMPONENT_ENV_FILENAME, MCP_ISSUER_KEY, PUBLIC_URL_KEY, describePublicUrlFinding, readEnvValue } from "../component-env.js";
+import { readTargetMcpRedirectFinding, mcpOAuthEnabledFromComponentEnv } from "../lib/mcp-oauth-env.js";
 import { AgentGateState, checkClaudeMdBootstrap, checkContinuityCaptureHooks, continuityWriteBlockers, describeAgentGateFinding, describeAgentHomeFinding, describeAgentIdRuleFinding, effectiveFlairUrl, embeddingsSkipRemedy, fixClaudeMdBootstrap, fixCommandAgentHint, fixContinuityCaptureHooks, fixSessionStartHook, inspectSessionStartHook, orphanInstanceSeedAdvisory, partitionKeyIds, planAgentIterations, readClientMcpBlock, resolveFixAgentId, resolveWireFlairUrl, upgradeSessionStartHookCommand } from "../doctor-client.js";
 import { FleetPresenceRow, markStale, sortOldestVersionFirst } from "../fleet-presence.js";
 import { hookSettingsPath, resolveHookAgentId } from "../hook-install.js";
@@ -31,6 +31,7 @@ import {
   probeInstanceIdentity,
 } from "../lib/instance-identity-row.js";
 import { FLAIR_MCP_PACKAGE, flairCliVersion, mcpServerSpec, unpinnedSpecWarning } from "../lib/mcp-spec.js";
+import { discriminateMcpOAuthDiscovery, reportMcpOAuthDiscovery, type McpOAuthDiscoverySeverity } from "../lib/mcp-enable.js";
 import { mcpClientPinFindings, refreshOwnedPins, repinSessionStartHookGuarded, sessionStartHookPinFindings } from "../lib/owned-pins.js";
 import * as render from "../render.js";
 import { checkVersion, formatVersionNudge, probeInstanceVersion, FLAIR_PKG_NAME } from "../version-check.js";
@@ -876,6 +877,7 @@ program
         if (existsSync(componentEnvPath)) componentEnvText = readFileSync(componentEnvPath, "utf-8");
       } catch { /* unreadable → treat as absent */ }
       const componentEnvValue = readEnvValue(componentEnvText, PUBLIC_URL_KEY);
+      const componentMcpIssuer = readEnvValue(componentEnvText, MCP_ISSUER_KEY);
 
       const finding = describePublicUrlFinding({
         advertisedIssuer,
@@ -905,6 +907,24 @@ program
         if (mcpRedirectFinding.fixHint) console.log(`     ${render.wrap(render.c.dim, "Fix:")} ${mcpRedirectFinding.fixHint}`);
         if (mcpRedirectFinding.isIssue) issues++;
       }
+
+      // flair#2283: share enable's discovery discriminator and infer report severity locally.
+      const discovery = await discriminateMcpOAuthDiscovery(baseUrl, {
+        expectedIssuers: [componentMcpIssuer, componentEnvValue, process.env.FLAIR_MCP_ISSUER, process.env.FLAIR_PUBLIC_URL].filter(
+          (issuer): issuer is string => typeof issuer === "string" && issuer.trim() !== "",
+        ),
+      });
+      const discoveryReport = reportMcpOAuthDiscovery(discovery, mcpOAuthEnabledFromComponentEnv(componentEnvText, process.env));
+      const discoveryIcons: Record<McpOAuthDiscoverySeverity, string> = {
+        ok: render.icons.ok,
+        info: render.icons.info,
+        warn: render.icons.warn,
+        error: render.icons.error,
+      };
+      discoveryReport.lines.forEach((line, index) => {
+        console.log(index === 0 ? `  ${discoveryIcons[discoveryReport.severity]} ${line}` : `     ${line}`);
+      });
+      if (discoveryReport.severity === "error") issues++;
     } else {
       console.log(`  ${render.icons.warn} MCP OAuth redirect: cannot verify target configuration`);
     }
