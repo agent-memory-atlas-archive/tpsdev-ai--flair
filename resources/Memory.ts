@@ -27,7 +27,7 @@ import {
   loadStoredPointer,
   projectRowsThroughPointers,
 } from "./memory-host-source.js";
-import { putPointerRow, deletePointerRowViaTable } from "./host-pointer-adapter.js";
+import { putPointerRow, deletePointerRowViaTable, restorePointerRowIfAbsent, PointerAlreadyStoredError } from "./host-pointer-adapter.js";
 import { DECLARED_MEMORY_ATTRIBUTES, stripUndeclaredMemoryAttributes, stripServerStampedFields } from "./memory-declared-attributes.js";
 import { composesCallerWrite, isJoinableTransaction, withOwnedTransaction, withSharedWriteTransaction } from "./request-transaction.js";
 import { PredecessorVisibilityChanged, applyGrantedVisibility, committedVisibilityDiffers, predecessorVisibilityChangedRefusal } from "./grant-visibility.js";
@@ -76,7 +76,7 @@ import { RECORD_TYPES } from "./record-types.js";
 import { attachTrust } from "./trust-block.js";
 import { recordCitations } from "./usage-recording.js";
 import { noteMemoryUpsert, noteMemoryDelete } from "./bm25-index-service.js";
-import { recordMemoryDeletion } from "./memory-deletion-history.js";
+import { recordMemoryDeletion, removeMemoryDeletionRecords } from "./memory-deletion-history.js";
 import { applyHitStats, clearHitStats, overlayHitStatsResult } from "./hit-tracking.js";
 import type { PointerRow } from "./host-source-visibility.js";
 import { refuseStaleClientWrite, stripClientVersionPassthrough } from "./client-version-gate.js";
@@ -338,6 +338,92 @@ async function verifyCommittedWrite(
     if (!sameDeclaredField(row[field], declared[field])) return { mismatch: true };
   }
   return {};
+}
+
+/** Attempts of an ordinary, non-skill Memory DELETE whose removal did not land. */
+const DELETE_APPLY_ATTEMPTS = 3;
+
+/**
+ * flair#2632 — 409 when an ordinary, non-skill Memory DELETE exhausts its
+ * removal attempts. The skill path closes the live head instead of removing it.
+ */
+function deleteNotAppliedRefusal(tableName: string, attempts: number): Response {
+  return new Response(
+    JSON.stringify({
+      error: "delete_not_applied",
+      message: `${tableName} row removal was not applied after ${attempts} attempts; not deleted`,
+    }),
+    { status: 409, headers: { "content-type": "application/json" } },
+  );
+}
+
+/** 500 when ordinary DELETE compensation cannot confirm history removal or
+ *  the restored/preserved pointer's identity. */
+function deleteCompensationFailure(message: string): Response {
+  return new Response(
+    JSON.stringify({ error: "delete_compensation_failed", message }),
+    { status: 500, headers: { "content-type": "application/json" } },
+  );
+}
+
+function sameDeleteTarget(
+  row: any,
+  target: { id: string; owner: unknown; token: unknown },
+  ownerField: string,
+): boolean {
+  return row != null && String(row.id) === target.id &&
+    (row[ownerField] ?? null) === target.owner &&
+    (row.instanceToken ?? null) === target.token;
+}
+
+/**
+ * flair#2632 — remove failed history; for a captured pointer, preserve an
+ * existing pointer or restore it if absent, then verify identity.
+ */
+async function compensateDroppedRemoval(
+  memoryId: string,
+  historyId: string | null,
+  pointerBefore: any,
+  ctx: any,
+): Promise<Response | null> {
+  try {
+    if (historyId !== null) {
+      const left = await removeMemoryDeletionRecords([historyId], ctx);
+      if (left.length > 0) {
+        return deleteCompensationFailure("the deletion-history record of a row that was not deleted is still stored");
+      }
+    }
+    if (pointerBefore) {
+      let expected = await loadStoredPointer(memoryId, {});
+      if (!expected) {
+        const pause = txnPausePoint("memory-delete-pointer-restore");
+        if (pause) await pause;
+        try {
+          await withOwnedTransaction(ctx, async (c) => {
+            expected = await loadStoredPointer(memoryId, c);
+            if (!expected) {
+              await restorePointerRowIfAbsent(pointerBefore, c);
+              const staged = txnPausePoint("memory-delete-pointer-restore-staged");
+              if (staged) await staged;
+              expected = pointerBefore;
+            }
+          });
+        } catch (err) {
+          if (!(err instanceof PointerAlreadyStoredError)) throw err;
+          expected = err.pointer;
+        }
+      }
+      const resulting = await loadStoredPointer(memoryId, {});
+      const fields = ["memoryId", "hostSource", "scopeAtWrite", "authorId", "memoryInstanceToken", "receivedAt"] as const;
+      if (!resulting || fields.some((field) => resulting[field] !== expected?.[field])) {
+        return deleteCompensationFailure("the restored or preserved host-pointer identity could not be confirmed");
+      }
+    }
+    return null;
+  } catch (err) {
+    console.error("Memory.delete: undoing a removal that did not land failed", err);
+    return deleteCompensationFailure("the partial writes of a delete that did not land could not be undone");
+  }
 }
 
 /** Mark the id after a failed post-commit verification read (flair#2478). */
@@ -3309,70 +3395,103 @@ export class Memory extends (databases as any).flair.Memory {
       return await writeSkillDelete({ ctx, auth, record });
     }
     // Durability controls retention, not the owner's authority to delete.
-    // A1' item 2 (adjudication 0a/0c): the Memory delete and its pointer
-    // delete share ONE transaction; with no request context
-    // withSharedWriteTransaction creates one. A failing pointer delete aborts
-    // it, so nothing is deleted; failures are NOT swallowed.
-    // A request-owned transaction may still abort after this method returns.
-    // Its committed change feed updates BM25 after commit; only a transaction
-    // owned here can use the synchronous hook after the shared write returns.
-    // Capture ownership before the helper changes the context's transaction.
-    const requestOwnsTransaction = isJoinableTransaction(ctx);
+    // A1' item 2 (adjudication 0a/0c): the Memory delete, its pointer delete
+    // and its deletion-history record share ONE owned transaction; a failing
+    // pointer delete aborts it, so nothing is deleted; failures are NOT
+    // swallowed. The transaction is OWNED here (withOwnedTransaction) so it
+    // commits before this method returns, which lets the confirmation below
+    // read the committed store (flair#2632).
     const deletionActor = auth.kind === "agent" ? auth.agentId : null;
     const deletionSourceClass: "agent" | "admin" | "internal" =
       auth.kind === "internal" ? "internal" : auth.isAdmin ? "admin" : "agent";
     // flair#2355: hold the row still before the delete stages, so a competing
-    // owner change can commit first and be seen by the re-read inside. This
-    // ordinary delete runs through withSharedWriteTransaction, which JOINS a
-    // request-owned transaction when one exists and creates one otherwise.
+    // owner change can commit first and be seen by the re-read inside.
+    const target = record ? {
+      id: String(record.id),
+      owner: record[RECORD_TYPES.Memory.ownerField] ?? null,
+      token: record.instanceToken ?? null,
+    } : null;
     const beforeDelete = txnPausePoint("memory-delete-pre");
     if (beforeDelete) await beforeDelete;
-    const deleteResult = await withSharedWriteTransaction(ctx, async (c) => {
-      const deletedId = typeof id === "string" ? id : record?.id;
-      if (typeof deletedId !== "string" || !deletedId) return false;
-      const stored = await (databases as any).flair.Memory.get(deletedId, c);
-      if (!stored) return false;
-      const nonAdmin = auth.kind === "agent" && !auth.isAdmin;
-      if (nonAdmin && isForbiddenOwnerMutation(stored, RECORD_TYPES.Memory.ownerField, auth.agentId)) {
-        // The caller passed the owner check at the pre-read above, so a
-        // mismatch here is a change committed since — refuse it, do not delete.
-        return ownerChangedRefusal("Memory");
-      }
-      if (nonAdmin) {
-        // Test-only: the transaction pauses between its ownership read and its
-        // delete.
-        const pause = txnPausePoint("memory-delete");
-        if (pause) await pause;
-        // Confirmation read of the COMMITTED row in an explicit fresh context
-        // (never contextless — see resources/owner-delete-recheck.ts's header).
-        const confirmed = await (databases as any).flair.Memory.get(deletedId, {});
-        if (confirmed && isForbiddenOwnerMutation(confirmed, RECORD_TYPES.Memory.ownerField, auth.agentId)) {
-          return ownerChangedRefusal("Memory");
+    type DeleteAttempt =
+      | { kind: "absent" }
+      | { kind: "response"; response: Response }
+      | { kind: "staged" };
+    // flair#2632: ordinary, non-skill DELETE confirms committed row absence.
+    // Retry dropped removals with fresh reads; refuse a changed id/owner/token.
+    const targetIdProbe = typeof id === "string" ? id : record?.id;
+    let applied = false;
+    for (let attempt = 1; attempt <= DELETE_APPLY_ATTEMPTS; attempt++) {
+      let historyId: string | null = null;
+      let pointerBefore: any = null;
+      const outcome = await withOwnedTransaction<DeleteAttempt>(ctx, async (c): Promise<DeleteAttempt> => {
+        const deletedId = typeof id === "string" ? id : record?.id;
+        if (typeof deletedId !== "string" || !deletedId) return { kind: "absent" };
+        const stored = await (databases as any).flair.Memory.get(deletedId, c);
+        if (!stored) return { kind: "absent" };
+        const nonAdmin = auth.kind === "agent" && !auth.isAdmin;
+        if (nonAdmin && isForbiddenOwnerMutation(stored, RECORD_TYPES.Memory.ownerField, auth.agentId)) {
+          // The caller passed the owner check at the pre-read above, so a
+          // mismatch here is a change committed since — refuse it, do not delete.
+          return { kind: "response", response: ownerChangedRefusal("Memory") };
         }
+        if (!target || !sameDeleteTarget(stored, target, RECORD_TYPES.Memory.ownerField)) {
+          return { kind: "response", response: storedRowChangedRefusal("Memory") };
+        }
+        if (nonAdmin) {
+          // Test-only: the transaction pauses between its ownership read and its
+          // delete.
+          const pause = txnPausePoint("memory-delete");
+          if (pause) await pause;
+          // Confirmation read of the COMMITTED row in an explicit fresh context
+          // (never contextless — see resources/owner-delete-recheck.ts's header).
+          const confirmed = await (databases as any).flair.Memory.get(deletedId, {});
+          if (confirmed && isForbiddenOwnerMutation(confirmed, RECORD_TYPES.Memory.ownerField, auth.agentId)) {
+            return { kind: "response", response: ownerChangedRefusal("Memory") };
+          }
+        }
+        // Captured for compensation: this attempt's pointer delete may land even
+        // when its row removal is dropped.
+        pointerBefore = await loadStoredPointer(deletedId, c);
+        const d = await (databases as any).flair.Memory.delete(deletedId, c);
+        if (d !== true) throw new Error("Memory row delete was not confirmed");
+        const pointerDenial = await deletePointerRow(deletedId, c);
+        if (pointerDenial) return { kind: "response", response: pointerDenial };
+        historyId = await recordMemoryDeletion({
+          memoryId: deletedId,
+          memoryInstanceToken: stored.instanceToken ?? null,
+          durability: stored.durability ?? null,
+          actor: deletionActor,
+          sourceClass: deletionSourceClass,
+        }, c);
+        return { kind: "staged" };
+      });
+      if (outcome.kind === "response") return outcome.response;
+      if (outcome.kind === "absent") return false;
+      // The owned transaction has committed. Its success is not proof that the
+      // queued delete was applied: confirm against the committed store.
+      const targetId = String(targetIdProbe);
+      const after = await (databases as any).flair.Memory.get(targetId, {});
+      if (!after) {
+        applied = true;
+        break;
       }
-      const d = await (databases as any).flair.Memory.delete(deletedId, c);
-      if (d !== true) throw new Error("Memory row delete was not confirmed");
-      const pointerDenial = await deletePointerRow(deletedId, c);
-      if (pointerDenial) return pointerDenial;
-      await recordMemoryDeletion({
-        memoryId: deletedId,
-        memoryInstanceToken: stored.instanceToken ?? null,
-        durability: stored.durability ?? null,
-        actor: deletionActor,
-        sourceClass: deletionSourceClass,
-      }, c);
-      return d;
-    });
-    if (deleteResult instanceof Response) return deleteResult;
-    if (deleteResult === false) return false;
-    // Use the RESOLVED deleted id (a by-record delete carries only `id`, so the
-    // stored row's id is the fallback). An owned transaction has committed;
-    // a request-owned write waits for the committed change feed instead.
-    const resolvedDeletedId = typeof id === "string" ? id : record?.id;
-    if (!requestOwnsTransaction && typeof resolvedDeletedId === "string" && resolvedDeletedId.length > 0) {
-      noteMemoryDelete(resolvedDeletedId);
+      // Still stored: the removal was dropped while this attempt's history and
+      // pointer writes landed. Undo them before the next attempt.
+      const compensation = await compensateDroppedRemoval(targetId, historyId, pointerBefore, ctx);
+      if (compensation) return compensation;
+      if (attempt < DELETE_APPLY_ATTEMPTS) {
+        // Test-only: holds a delete whose removal did not land between attempts.
+        const retry = txnPausePoint("memory-delete-retry");
+        if (retry) await retry;
+      }
+    }
+    if (!applied) return deleteNotAppliedRefusal("Memory", DELETE_APPLY_ATTEMPTS);
+    // An owned transaction has committed and its removal is confirmed.
+    if (typeof targetIdProbe === "string" && targetIdProbe.length > 0) {
+      noteMemoryDelete(targetIdProbe);
     }
     if (typeof id === "string") await clearHitStats(id, ctx).catch(() => {});
-    return deleteResult;
+    return true;
   }
 }
