@@ -116,12 +116,16 @@ add("Memory", ["alias-source:(databases as any).flair.Memory#2"],
 for (const [file, alias] of [
   ["Memory", "alias-source:(databases as any).flair.Memory#1"],
   ["Memory", "alias-source:(databases as any).flair.Memory#3"],
-  // #4 is the class heritage; #3/#5/#6/#7/#8 read committed rows.
+  // #4 is the class heritage; #3/#5/#6/#7/#8 and #9-#11 read committed rows.
   ["Memory", "alias-source:(databases as any).flair.Memory#4"],
   ["Memory", "alias-source:(databases as any).flair.Memory#5"],
   ["Memory", "alias-source:(databases as any).flair.Memory#6"],
   ["Memory", "alias-source:(databases as any).flair.Memory#7"],
   ["Memory", "alias-source:(databases as any).flair.Memory#8"],
+  ["Memory", "alias-source:(databases as any).flair.Memory#9"],
+  ["Memory", "alias-source:(databases as any).flair.Memory#10"],
+  // #9/#10 feed confirmCommittedRow and #11 the post-commit verifyWrittenRow: committed-row reads only.
+  ["Memory", "alias-source:(databases as any).flair.Memory#11"],
   // The write-lock store handle (flair#2478) — a read of primaryStore, never a write.
   ["Memory", "alias-source:(databases as any)?.flair?.Memory#1"],
   ["AdminMemory", "alias-source:(databases as any).flair.Memory#1"],
