@@ -7,6 +7,7 @@ import nacl from "tweetnacl";
 import { HarperInstance, startHarper, stopHarper, HARPER_STOP_BUDGET_MS } from "../helpers/harper-lifecycle";
 import { WRITE_BACK_ATTEMPTS } from "../../resources/write-back.ts";
 import { getModelId } from "../../resources/embeddings-provider.ts";
+import { promotionContentHash } from "../../resources/promotion-binding.ts";
 
 interface TestAgent { id: string; publicKey: string; secretKey: Uint8Array; }
 function mkAgent(id: string): TestAgent {
@@ -111,9 +112,8 @@ async function withPaused<T>(point: string, trigger: () => Promise<Response>, co
   return { response, competed, released, paused };
 }
 
-/** The promoted Memory row a paused sweep wrote: the id is minted inside the
- *  handler, so the competing writer finds it by its owning agent + content. */
-async function findPromotedRow(harper: HarperInstance, agentId: string, claim: string): Promise<any> {
+/** Every Memory row owned by `agentId`, read through the admin ops API. */
+async function memoryRowsForAgent(harper: HarperInstance, agentId: string): Promise<any[]> {
   const res = await adminOp(harper, {
     operation: "search_by_value", database: "flair", table: "Memory",
     search_attribute: "agentId", search_value: agentId, get_attributes: ["*"],
@@ -121,7 +121,13 @@ async function findPromotedRow(harper: HarperInstance, agentId: string, claim: s
   const text = await res.text();
   expect(res.status, `search_by_value returned ${res.status}: ${text.slice(0, 200)}`).toBe(200);
   const rows = JSON.parse(text) as any[];
-  return (Array.isArray(rows) ? rows : []).find((r) => r?.content === claim) ?? null;
+  return Array.isArray(rows) ? rows : [];
+}
+
+/** The promoted Memory row a paused sweep wrote: the id is minted inside the
+ *  handler, so the competing writer finds it by its owning agent + content. */
+async function findPromotedRow(harper: HarperInstance, agentId: string, claim: string): Promise<any> {
+  return (await memoryRowsForAgent(harper, agentId)).find((r) => r?.content === claim) ?? null;
 }
 
 /** Seed a PENDING ADK candidate (scopeTag-bearing, the shape the unattended
@@ -668,6 +674,359 @@ describe("flair#2354 — the promotion stamp write-back under a concurrent chang
     const cand = await readCandidate(harper, "wbc-stamp-cand-clean");
     expect(cand?.status, "a landed verdict marks the candidate promoted").toBe("promoted");
   }, 60_000);
+
+  it("a refused stamp records its row; a changed incarnation is not reused", async () => {
+    const agentId = "wbc-stamp-agent-recover";
+    const stampAgent = mkAgent(agentId);
+    await seedAgent(harper, stampAgent);
+    const claim = "promotion stamp claim for the recovery sweep";
+    await seedCandidate(harper, agentId, {
+      id: "wbc-stamp-cand-recover", claim, scopeTag: `adk:app:${agentId}`, sourceMemoryIds: [],
+    });
+    const TOKEN2 = randomUUID();
+
+    // Sweep 1: the row is written, then a competing incarnation token replaces
+    // the one the sweep wrote and recorded, so its stamp is refused.
+    const { response, released, paused, competed } = await withPaused(
+      "promotion-stamp-select",
+      () => authSend(harper, stampAgent, "POST", "/AutoPromoteCandidates", { agentId }),
+      async () => {
+        const row = await findPromotedRow(harper, agentId, claim);
+        if (!row) throw new Error(`no promoted row for ${agentId} while paused`);
+        const status = await updateRow(harper, { id: row.id, instanceToken: TOKEN2 });
+        expect(status, `competing update returned ${status}`).toBe(200);
+        return row.id as string;
+      },
+    );
+    expect(paused, "the promotion stamp did not pause").toBe(true);
+    expect(released, "the promotion stamp was not paused and released by this test").toBe("go");
+    expect(response.status, (await response.clone().text()).slice(0, 300)).toBeLessThan(300);
+    const first = await response.json() as any;
+    expect(first.skipped.find((s: any) => s.id === "wbc-stamp-cand-recover")?.reason).toBe("stamp_refused");
+
+    const rowAfterSweep1 = await readRow(harper, competed as string);
+    expect(rowAfterSweep1?.content).toBe(claim);
+    expect(rowAfterSweep1?.promotionStatus ?? null).toBeNull();
+    const candAfterSweep1 = await readCandidate(harper, "wbc-stamp-cand-recover");
+    expect(candAfterSweep1?.status).toBe("pending");
+    expect(candAfterSweep1?.promotedRowId, "the sweep records the row it wrote").toBe(competed);
+    expect(typeof candAfterSweep1?.promotedRowInstanceToken).toBe("string");
+    expect(candAfterSweep1.promotedRowInstanceToken.length).toBeGreaterThan(0);
+    expect(candAfterSweep1.promotedRowInstanceToken, "the recorded token is the one the sweep wrote, not the replacement").not.toBe(TOKEN2);
+
+    // Sweep 2: the recorded row is no longer that incarnation, so it is not
+    // reused; a fresh row is written and the recorded row stays unstamped.
+    const second = await authSend(harper, stampAgent, "POST", "/AutoPromoteCandidates", { agentId });
+    expect(second.status, (await second.clone().text()).slice(0, 300)).toBeLessThan(300);
+    const body = await second.json() as any;
+    const rows = (await memoryRowsForAgent(harper, agentId)).filter((r) => r.content === claim);
+    expect(rows.length, "the changed incarnation must not be reused").toBe(2);
+    const recordedRow = rows.find((r) => r.id === competed);
+    expect(recordedRow?.promotionStatus ?? null, "nothing is stamped onto the changed row").toBeNull();
+    const freshRow = rows.find((r) => r.id !== competed);
+    expect(freshRow?.promotionStatus, "the fresh row carries the verdict").toBe("approved");
+    expect(freshRow?.promotedBy).toBeTruthy();
+    expect(body.promoted, "the sweep reports the row it stamped").toContain(freshRow?.id);
+    expect(body.promoted).not.toContain(competed);
+    const candAfterSweep2 = await readCandidate(harper, "wbc-stamp-cand-recover");
+    expect(candAfterSweep2?.status).toBe("promoted");
+    expect(candAfterSweep2?.promotedRowId).toBe(freshRow?.id);
+  }, 60_000);
+
+  it("reuses and stamps the unchanged row a pending candidate records", async () => {
+    const agentId = "wbc-stamp-agent-reuse";
+    const stampAgent = mkAgent(agentId);
+    await seedAgent(harper, stampAgent);
+    const claim = "promotion stamp claim for a successive sweep";
+    const candidateId = "wbc-stamp-cand-reuse";
+    const rowId = "wbc-stamp-row-reuse";
+    const token = randomUUID();
+    // The state a sweep that wrote the row and had its stamp refused leaves:
+    // the candidate is pending and records the row it wrote; the row is
+    // unstamped and carries the fields the sweep writes.
+    await insertRow(harper, {
+      id: rowId, agentId, content: claim, contentHash: rowId, instanceToken: token,
+      visibility: "private", durability: "persistent",
+      tags: [`adk:app:${agentId}`, "nightly-rem-promoted", "auto-promoted", `from:${candidateId}`],
+    });
+    await seedCandidate(harper, agentId, {
+      id: candidateId, claim, scopeTag: `adk:app:${agentId}`, sourceMemoryIds: [],
+      promotedRowId: rowId, promotedRowInstanceToken: token,
+    });
+
+    const response = await authSend(harper, stampAgent, "POST", "/AutoPromoteCandidates", { agentId });
+    expect(response.status, (await response.clone().text()).slice(0, 300)).toBeLessThan(300);
+    const body = await response.json() as any;
+    const rows = (await memoryRowsForAgent(harper, agentId)).filter((r) => r.content === claim);
+    expect(rows.length, "the retry wrote a duplicate promoted row").toBe(1);
+    expect(rows[0].id).toBe(rowId);
+    expect(rows[0].promotionStatus, "the verdict landed on the recorded row").toBe("approved");
+    expect(rows[0].promotedBy).toBeTruthy();
+    expect(rows[0].promotionContentHash, "the verdict is bound to the recorded row's stored content")
+      .toBe(promotionContentHash(claim));
+    expect(body.promoted, "the sweep reports the row it stamped").toContain(rowId);
+    expect((await readCandidate(harper, candidateId))?.status).toBe("promoted");
+  }, 60_000);
+
+  it("refuses to stamp a recorded row the owner archives before the stamp takes its lock", async () => {
+    const agentId = "wbc-stamp-agent-archived-entry";
+    const stampAgent = mkAgent(agentId);
+    await seedAgent(harper, stampAgent);
+    const claim = "promotion stamp claim archived before the stamp";
+    const candidateId = "wbc-stamp-cand-archived-entry";
+    const rowId = "wbc-stamp-row-archived-entry";
+    const token = randomUUID();
+    // A recorded, unstamped row that passes the reuse lookup.
+    await insertRow(harper, {
+      id: rowId, agentId, content: claim, contentHash: rowId, instanceToken: token,
+      visibility: "private", durability: "persistent",
+      tags: [`adk:app:${agentId}`, "nightly-rem-promoted", "auto-promoted", `from:${candidateId}`],
+    });
+    await seedCandidate(harper, agentId, {
+      id: candidateId, claim, scopeTag: `adk:app:${agentId}`, sourceMemoryIds: [],
+      promotedRowId: rowId, promotedRowInstanceToken: token,
+    });
+
+    // promotion-stamp-entry: after the lookup chose the row, before the stamp's
+    // lock and first read. The owner archives the row through its own PATCH.
+    const { response, released, paused, competed } = await withPaused(
+      "promotion-stamp-entry",
+      () => authSend(harper, stampAgent, "POST", "/AutoPromoteCandidates", { agentId }),
+      async () => {
+        const patch = await authSend(harper, stampAgent, "PATCH", `/Memory/${rowId}`, { archived: true });
+        return { status: patch.status, text: (await patch.text()).slice(0, 300) };
+      },
+    );
+    expect(paused, "the promotion stamp did not pause at its entry").toBe(true);
+    expect(released, "the promotion stamp was not paused and released by this test").toBe("go");
+    expect(competed?.status, `the owner's archive PATCH was not applied: ${competed?.text}`).toBeLessThan(300);
+    expect(response.status, (await response.clone().text()).slice(0, 300)).toBeLessThan(300);
+    const body = await response.json() as any;
+    expect(body.skipped.find((s: any) => s.id === candidateId)?.reason, "the stamp on the archived row is refused").toBe("stamp_refused");
+    expect(body.promoted).not.toContain(rowId);
+    const row = await readRow(harper, rowId);
+    expect(row?.archived, "the owner's archive is kept").toBe(true);
+    expect(row?.instanceToken).toBe(token);
+    expect(row?.promotionStatus ?? null, "no verdict is stamped onto the archived row").toBeNull();
+    expect(row?.promotedBy ?? null, "no reviewer is stamped onto the archived row").toBeNull();
+    expect(row?.promotionContentHash ?? null, "no content binding is stamped onto the archived row").toBeNull();
+    const rows = (await memoryRowsForAgent(harper, agentId)).filter((r) => r.content === claim);
+    expect(rows.length, "the sweep chose the recorded row and wrote no other").toBe(1);
+    const cand = await readCandidate(harper, candidateId);
+    expect(cand?.status, "a refused stamp leaves the candidate pending").toBe("pending");
+    expect(cand?.promotedRowId).toBe(rowId);
+    expect(cand?.promotedRowInstanceToken).toBe(token);
+  }, 60_000);
+
+  it("does not reuse a row with the candidate's tag and claim that the sweep did not write", async () => {
+    const agentId = "wbc-stamp-agent-owner-row";
+    const stampAgent = mkAgent(agentId);
+    await seedAgent(harper, stampAgent);
+    const claim = "promotion stamp claim with an owner-written row";
+    const candidateId = "wbc-stamp-cand-owner-row";
+    const ownerRowId = "wbc-stamp-row-owner-written";
+    // The owner can write its own Memory rows with this candidate's tag and
+    // claim; the candidate records no row, so none of them is reused.
+    await insertRow(harper, {
+      id: ownerRowId, agentId, content: claim, contentHash: ownerRowId, instanceToken: randomUUID(),
+      visibility: "private", durability: "persistent",
+      tags: [`adk:app:${agentId}`, "nightly-rem-promoted", "auto-promoted", `from:${candidateId}`],
+    });
+    await seedCandidate(harper, agentId, { id: candidateId, claim, scopeTag: `adk:app:${agentId}`, sourceMemoryIds: [] });
+
+    const response = await authSend(harper, stampAgent, "POST", "/AutoPromoteCandidates", { agentId });
+    expect(response.status, (await response.clone().text()).slice(0, 300)).toBeLessThan(300);
+    const body = await response.json() as any;
+    const rows = (await memoryRowsForAgent(harper, agentId)).filter((r) => r.content === claim);
+    expect(rows.length, "the owner-written row must not be reused").toBe(2);
+    const ownerRow = rows.find((r) => r.id === ownerRowId);
+    expect(ownerRow?.promotionStatus ?? null, "nothing is stamped onto the owner-written row").toBeNull();
+    const freshRow = rows.find((r) => r.id !== ownerRowId);
+    expect(freshRow?.promotionStatus, "the sweep writes and stamps its own row").toBe("approved");
+    expect(body.promoted).toContain(freshRow?.id);
+    expect(body.promoted).not.toContain(ownerRowId);
+  }, 60_000);
+
+  it("does not reuse a matching row the owner wrote through the Memory resource", async () => {
+    const agentId = "wbc-stamp-agent-client-row";
+    const stampAgent = mkAgent(agentId);
+    await seedAgent(harper, stampAgent);
+    const claim = "promotion stamp claim with a row the owner wrote through /Memory";
+    const candidateId = "wbc-stamp-cand-client-row";
+    const clientRowId = "wbc-stamp-row-client-written";
+    const sweepTags = [`adk:app:${agentId}`, "nightly-rem-promoted", "auto-promoted", `from:${candidateId}`];
+    // The owner's own authenticated Memory write: the candidate's claim, every
+    // tag the sweep writes, and the sweep's visibility and durability.
+    const written = await authSend(harper, stampAgent, "PUT", `/Memory/${clientRowId}`, {
+      id: clientRowId, agentId, content: claim, visibility: "private", durability: "persistent", tags: sweepTags,
+    });
+    expect(written.status, (await written.clone().text()).slice(0, 300)).toBeLessThan(300);
+    const clientRow = await readRow(harper, clientRowId);
+    expect(clientRow?.agentId).toBe(agentId);
+    expect(clientRow?.content).toBe(claim);
+    expect(clientRow?.visibility).toBe("private");
+    expect(clientRow?.durability).toBe("persistent");
+    expect(clientRow?.archived === true, "the owner-written row is live").toBe(false);
+    for (const tag of sweepTags) expect(clientRow?.tags, `the owner-written row carries ${tag}`).toContain(tag);
+    expect(clientRow?.promotionStatus ?? null, "the owner-written row starts unstamped").toBeNull();
+    expect(typeof clientRow?.instanceToken).toBe("string");
+    await seedCandidate(harper, agentId, { id: candidateId, claim, scopeTag: `adk:app:${agentId}`, sourceMemoryIds: [] });
+
+    const response = await authSend(harper, stampAgent, "POST", "/AutoPromoteCandidates", { agentId });
+    expect(response.status, (await response.clone().text()).slice(0, 300)).toBeLessThan(300);
+    const body = await response.json() as any;
+    const rows = (await memoryRowsForAgent(harper, agentId)).filter((r) => r.content === claim);
+    expect(rows.length, "the owner-written row must not be reused").toBe(2);
+    const ownerRow = rows.find((r) => r.id === clientRowId);
+    expect(ownerRow?.promotionStatus ?? null, "nothing is stamped onto the owner-written row").toBeNull();
+    expect(ownerRow?.promotedBy ?? null, "no reviewer is stamped onto the owner-written row").toBeNull();
+    expect(ownerRow?.promotedAt ?? null, "no decision time is stamped onto the owner-written row").toBeNull();
+    expect(ownerRow?.promotionContentHash ?? null, "no content binding is stamped onto the owner-written row").toBeNull();
+    expect(ownerRow?.instanceToken, "the owner-written row keeps its incarnation").toBe(clientRow.instanceToken);
+    const freshRow = rows.find((r) => r.id !== clientRowId);
+    expect(freshRow?.promotionStatus, "the sweep writes and stamps its own row").toBe("approved");
+    expect(body.promoted).toContain(freshRow?.id);
+    expect(body.promoted).not.toContain(clientRowId);
+    const cand = await readCandidate(harper, candidateId);
+    expect(cand?.status).toBe("promoted");
+    expect(cand?.promotedRowId, "the candidate records the row the sweep wrote").toBe(freshRow?.id);
+  }, 60_000);
+
+  for (const mismatch of [
+    { name: "visibility", visibility: "shared", durability: "persistent" },
+    { name: "durability", visibility: "private", durability: "standard" },
+  ] as const) {
+    it(`does not reuse a recorded row with the wrong ${mismatch.name}`, async () => {
+      const agentId = `wbc-stamp-agent-wrong-${mismatch.name}`;
+      const stampAgent = mkAgent(agentId);
+      await seedAgent(harper, stampAgent);
+      const claim = `promotion stamp claim with the wrong ${mismatch.name}`;
+      const candidateId = `wbc-stamp-cand-wrong-${mismatch.name}`;
+      const rowId = `wbc-stamp-row-wrong-${mismatch.name}`;
+      const token = randomUUID();
+      await insertRow(harper, {
+        id: rowId, agentId, content: claim, contentHash: rowId, instanceToken: token,
+        visibility: mismatch.visibility, durability: mismatch.durability,
+        tags: [`adk:app:${agentId}`, "nightly-rem-promoted", "auto-promoted", `from:${candidateId}`],
+      });
+      await seedCandidate(harper, agentId, {
+        id: candidateId, claim, scopeTag: `adk:app:${agentId}`, sourceMemoryIds: [],
+        promotedRowId: rowId, promotedRowInstanceToken: token,
+      });
+
+      const response = await authSend(harper, stampAgent, "POST", "/AutoPromoteCandidates", { agentId });
+      expect(response.status, (await response.clone().text()).slice(0, 300)).toBeLessThan(300);
+      const body = await response.json() as any;
+      const rows = (await memoryRowsForAgent(harper, agentId)).filter((r) => r.content === claim);
+      expect(rows.length, `the row with the wrong ${mismatch.name} must not be reused`).toBe(2);
+      const wrongRow = rows.find((r) => r.id === rowId);
+      expect(wrongRow?.promotionStatus ?? null, "nothing is stamped onto the mismatched row").toBeNull();
+      const freshRow = rows.find((r) => r.id !== rowId);
+      expect(freshRow?.promotionStatus, "the sweep writes and stamps its own row").toBe("approved");
+      expect(body.promoted).toContain(freshRow?.id);
+      expect(body.promoted).not.toContain(rowId);
+    }, 60_000);
+  }
+
+  it("the recorded promoted-row identity on a candidate is server-written", async () => {
+    const agentId = "wbc-stamp-agent-identity";
+    const agent = mkAgent(agentId);
+    await seedAgent(harper, agent);
+    const candidateId = "wbc-stamp-cand-identity";
+    await seedCandidate(harper, agentId, {
+      id: candidateId, claim: "promotion stamp claim with a client write", scopeTag: `adk:app:${agentId}`, sourceMemoryIds: [],
+    });
+    const before = await authSend(harper, agent, "GET", `/MemoryCandidate/${candidateId}`);
+    expect(before.status).toBe(200);
+    const stored = await before.json() as any;
+    const put = await authSend(harper, agent, "PUT", `/MemoryCandidate/${candidateId}`, { ...stored, promotedRowId: "forged-row" });
+    expect(put.status, (await put.clone().text()).slice(0, 300)).toBe(403);
+    const post = await authSend(harper, agent, "POST", "/MemoryCandidate", {
+      id: "wbc-stamp-cand-identity-create", agentId, claim: "A staged claim.", status: "pending",
+      generatedAt: new Date().toISOString(), generatedBy: "test-seed",
+      promotedRowId: "forged-row", promotedRowInstanceToken: "forged-token",
+    });
+    expect(post.status, (await post.clone().text()).slice(0, 300)).toBe(403);
+    expect((await readCandidate(harper, candidateId))?.promotedRowId ?? null, "the refused write changed nothing").toBeNull();
+    expect(await readCandidate(harper, "wbc-stamp-cand-identity-create")).toBeNull();
+  }, 60_000);
+
+  /** A pending candidate that records a promoted row, and the owner's view of it. */
+  async function recordedIdentityCandidate(slug: string) {
+    const agentId = `wbc-stamp-agent-identity-${slug}`;
+    const agent = mkAgent(agentId);
+    await seedAgent(harper, agent);
+    const candidateId = `wbc-stamp-cand-identity-${slug}`;
+    const recordedId = `wbc-stamp-row-identity-${slug}`;
+    const recordedToken = randomUUID();
+    await seedCandidate(harper, agentId, {
+      id: candidateId, claim: `promotion stamp claim with a recorded identity (${slug})`, scopeTag: `adk:app:${agentId}`,
+      sourceMemoryIds: [], promotedRowId: recordedId, promotedRowInstanceToken: recordedToken,
+    });
+    const before = await authSend(harper, agent, "GET", `/MemoryCandidate/${candidateId}`);
+    expect(before.status).toBe(200);
+    const stored = await before.json() as any;
+    expect(stored.promotedRowId).toBe(recordedId);
+    expect(stored.promotedRowInstanceToken).toBe(recordedToken);
+    const { promotedRowId: _id, promotedRowInstanceToken: _token, ...withoutIdentity } = stored;
+    return { agent, candidateId, recordedId, recordedToken, withoutIdentity };
+  }
+
+  for (const verb of ["PUT", "PATCH"] as const) {
+    for (const forgery of [
+      { slug: "token", name: "promotedRowInstanceToken only", fields: () => ({ promotedRowInstanceToken: randomUUID() }), refused: /^forbidden: promotedRowInstanceToken is set by the promotion workflow$/ },
+      { slug: "id", name: "promotedRowId only", fields: () => ({ promotedRowId: "wbc-stamp-row-identity-forged" }), refused: /^forbidden: promotedRowId is set by the promotion workflow$/ },
+      {
+        slug: "both", name: "both promoted-row fields",
+        fields: () => ({ promotedRowId: "wbc-stamp-row-identity-forged", promotedRowInstanceToken: randomUUID() }),
+        refused: /^forbidden: promotedRow(Id|InstanceToken) is set by the promotion workflow$/,
+      },
+    ]) {
+      it(`refuses an owner ${verb} that sets ${forgery.name} on a candidate and keeps the recorded identity`, async () => {
+        const c = await recordedIdentityCandidate(`${verb.toLowerCase()}-${forgery.slug}`);
+        const body = verb === "PUT" ? { ...c.withoutIdentity, ...forgery.fields() } : forgery.fields();
+        const res = await authSend(harper, c.agent, verb, `/MemoryCandidate/${c.candidateId}`, body);
+        const text = await res.text();
+        // The stored candidate is read back before the response is judged.
+        const after = await readCandidate(harper, c.candidateId);
+        expect(after?.promotedRowId, `the refused write keeps the recorded id (${res.status})`).toBe(c.recordedId);
+        expect(after?.promotedRowInstanceToken, `the refused write keeps the recorded token (${res.status})`).toBe(c.recordedToken);
+        expect(res.status, text.slice(0, 300)).toBe(403);
+        expect(JSON.parse(text).error).toMatch(forgery.refused);
+      }, 60_000);
+    }
+  }
+
+  it("accepts an owner PUT or PATCH that leaves the recorded promoted-row identity out, and keeps it", async () => {
+    const c = await recordedIdentityCandidate("unchanged");
+    const put = await authSend(harper, c.agent, "PUT", `/MemoryCandidate/${c.candidateId}`, { ...c.withoutIdentity, rationalePrompt: "owner edit by PUT" });
+    expect(put.status, (await put.clone().text()).slice(0, 300)).toBeLessThan(300);
+    const afterPut = await readCandidate(harper, c.candidateId);
+    expect(afterPut?.rationalePrompt).toBe("owner edit by PUT");
+    expect(afterPut?.promotedRowId, "a PUT that omits the identity keeps the recorded id").toBe(c.recordedId);
+    expect(afterPut?.promotedRowInstanceToken, "a PUT that omits the identity keeps the recorded token").toBe(c.recordedToken);
+    const patch = await authSend(harper, c.agent, "PATCH", `/MemoryCandidate/${c.candidateId}`, { rationalePrompt: "owner edit by PATCH" });
+    expect(patch.status, (await patch.clone().text()).slice(0, 300)).toBeLessThan(300);
+    const afterPatch = await readCandidate(harper, c.candidateId);
+    expect(afterPatch?.rationalePrompt).toBe("owner edit by PATCH");
+    expect(afterPatch?.promotedRowId, "a PATCH without the identity keeps the recorded id").toBe(c.recordedId);
+    expect(afterPatch?.promotedRowInstanceToken, "a PATCH without the identity keeps the recorded token").toBe(c.recordedToken);
+  }, 60_000);
+
+  for (const verb of ["PUT", "PATCH"] as const) {
+    it(`accepts an owner ${verb} that carries content and leaves the recorded promoted-row identity out, and keeps it`, async () => {
+      const c = await recordedIdentityCandidate(`${verb.toLowerCase()}-content`);
+      const edit = { content: `owner content edit by ${verb}`, rationalePrompt: `owner edit with content by ${verb}` };
+      const body = verb === "PUT" ? { ...c.withoutIdentity, ...edit } : edit;
+      const res = await authSend(harper, c.agent, verb, `/MemoryCandidate/${c.candidateId}`, body);
+      expect(res.status, (await res.clone().text()).slice(0, 300)).toBeLessThan(300);
+      const after = await readCandidate(harper, c.candidateId);
+      expect(after?.rationalePrompt, `the ${verb} was applied`).toBe(edit.rationalePrompt);
+      expect(after?.content, `the ${verb}'s content was stored`).toBe(edit.content);
+      expect(after?.promotedRowId, `a ${verb} carrying content keeps the recorded id`).toBe(c.recordedId);
+      expect(after?.promotedRowInstanceToken, `a ${verb} carrying content keeps the recorded token`).toBe(c.recordedToken);
+    }, 60_000);
+  }
 
   // promotion-stamp-select: between the Memory write and the stamp's first
   // read; the other two are the write-back helper's own points.

@@ -8,11 +8,18 @@ import { promotionContentHash } from "./promotion-binding.js";
 import { withMemoryWriteLock, withMemoryWriteLockOnce, type MemoryLockOutcome } from "./memory-write-lock.js";
 
 /** The row a promotion's Memory write produced: its owner, content and
- *  incarnation token. */
+ *  incarnation token. A row an earlier sweep recorded adds the fields that
+ *  sweep wrote and requires the row to be unstamped and not archived; all of
+ *  them are re-checked at the stamp's first read, under the per-id Memory lock. */
 export interface PromotedRowIdentity {
   agentId: unknown;
   content: unknown;
   instanceToken: unknown;
+  tags?: string[];
+  visibility?: string;
+  durability?: string;
+  unstamped?: boolean;
+  unarchived?: boolean;
 }
 
 /** The stamp's first read is not the row the promotion wrote: nothing stamped. */
@@ -40,8 +47,16 @@ export class PromotionStampLockError extends Error {
 }
 
 function isWrittenRow(row: any, written: PromotedRowIdentity | undefined): boolean {
-  return written != null && typeof written.instanceToken === "string" && written.instanceToken.length > 0 &&
-    row.agentId === written.agentId && row.content === written.content && row.instanceToken === written.instanceToken;
+  if (written == null || typeof written.instanceToken !== "string" || written.instanceToken.length === 0) return false;
+  if (row.agentId !== written.agentId || row.content !== written.content ||
+    row.instanceToken !== written.instanceToken) return false;
+  if (written.unstamped && row.promotionStatus != null) return false;
+  if (written.unarchived && row.archived === true) return false;
+  if (written.visibility !== undefined && row.visibility !== written.visibility) return false;
+  if (written.durability !== undefined && row.durability !== written.durability) return false;
+  if (written.tags !== undefined &&
+    (!Array.isArray(row.tags) || !written.tags.every((tag) => row.tags.includes(tag)))) return false;
+  return true;
 }
 
 /** The incremental update a stamp writes: the verdict fields plus the hash of
@@ -136,8 +151,10 @@ export async function stampMemoryPromotion(
 }
 
 /** Stamp after a successful Memory write. Report failures without aborting the sweep.
- * Auto-promotion uses this non-fatal wrapper; manual promotion calls
- * stampMemoryPromotion directly, so a stamp failure fails that request. */
+ * Auto-promotion uses this non-fatal wrapper and leaves its candidate pending
+ * with `stamp_refused` (flair#2651), so the next sweep retries it; manual
+ * promotion calls stampMemoryPromotion directly, so a stamp failure fails that
+ * request. */
 export async function stampMemoryPromotionIsolated(
   id: string, reviewerId: string, decidedAt: string, enumerationContext?: any, written?: PromotedRowIdentity,
 ): Promise<boolean> {
