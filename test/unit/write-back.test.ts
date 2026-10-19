@@ -18,9 +18,48 @@ import { isDeepStrictEqual } from "node:util";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { WRITE_BACK_ATTEMPTS, WRITE_BACK_IDENTITY_FIELDS, WriteBackConflictError, writeBackCommittedRow, writeBackIdentity } from "../../resources/write-back";
+import { HARPER_MANAGED_FIELDS, WRITE_BACK_ATTEMPTS, WRITE_BACK_IDENTITY_FIELDS, WriteBackConflictError, verifyCommittedFields, withoutHarperManagedFields, writeBackCommittedRow, writeBackIdentity } from "../../resources/write-back";
 
 type Row = { id: string } & Record<string, unknown>;
+
+for (const absent of [null, undefined]) {
+  test(`verifyCommittedFields: ${absent} is a mismatch without calling also`, async () => {
+    let calls = 0;
+    const table = { async get() { return absent; } };
+    const verdict = await verifyCommittedFields(table, "m1", { id: "m1" }, { content: "staged" }, () => {
+      calls++;
+      throw new Error("also must not see an absent row");
+    });
+    expect(verdict).toBe("mismatch");
+    expect(calls).toBe(0);
+  });
+}
+
+describe("withoutHarperManagedFields — the application fields of a spread row (flair#2656)", () => {
+  const staged = {
+    id: "p1", createdAt: "2026-01-01T00:00:00.000Z", status: "paired", pairAttemptWriteId: "w1",
+    __createdtime__: 1000, __updatedtime__: 1000,
+  };
+
+  test("drops exactly Harper's two timestamps and keeps every other field, leaving the row unchanged", () => {
+    expect([...HARPER_MANAGED_FIELDS]).toEqual(["__createdtime__", "__updatedtime__"]);
+    const fields = withoutHarperManagedFields(staged);
+    expect(fields).toEqual({ id: "p1", createdAt: "2026-01-01T00:00:00.000Z", status: "paired", pairAttemptWriteId: "w1" });
+    expect(staged.__updatedtime__).toBe(1000);
+    expect(staged.__createdtime__).toBe(1000);
+  });
+
+  test("verifyCommittedFields stays strict: a named timestamp that moved is a mismatch; the application fields are shown", async () => {
+    const table = { async get() { return { ...staged, __updatedtime__: 2000 }; } };
+    expect(await verifyCommittedFields(table, "p1", staged, staged)).toBe("mismatch");
+    expect(await verifyCommittedFields(table, "p1", staged, withoutHarperManagedFields(staged))).toBe("shown");
+  });
+
+  test("an application field that differs is still a mismatch without the timestamps", async () => {
+    const table = { async get() { return { ...staged, pairAttemptWriteId: "other-attempt", __updatedtime__: 2000 }; } };
+    expect(await verifyCommittedFields(table, "p1", staged, withoutHarperManagedFields(staged))).toBe("mismatch");
+  });
+});
 
 /**
  * A fake Memory table with the helper's staged-write / committed-read model.

@@ -121,7 +121,12 @@ add("Memory", ["alias-source:(databases as any).flair.Memory#2"],
 for (const [file, alias] of [
   ["Memory", "alias-source:(databases as any).flair.Memory#1"],
   ["Memory", "alias-source:(databases as any).flair.Memory#3"],
-  // #4 is the class heritage; #3/#5/#6/#7/#8 and #9-#11 read committed rows.
+  // The committed-row confirms and post-commit verification reads: #3 the
+  // re-embed's confirm (flair#2465) and #4 its post-commit verification
+  // (flair#2656); #5 the class heritage. #6/#8/#9/#12 are the Memory PUT,
+  // composed PUT, PATCH and ordinary PUT verifyWrittenRow reads; #7/#10/#11
+  // feed confirmCommittedRow the Memory PUT new row, the reindex re-PUT and
+  // the composed PUT: committed-row reads only.
   ["Memory", "alias-source:(databases as any).flair.Memory#4"],
   ["Memory", "alias-source:(databases as any).flair.Memory#5"],
   ["Memory", "alias-source:(databases as any).flair.Memory#6"],
@@ -129,8 +134,8 @@ for (const [file, alias] of [
   ["Memory", "alias-source:(databases as any).flair.Memory#8"],
   ["Memory", "alias-source:(databases as any).flair.Memory#9"],
   ["Memory", "alias-source:(databases as any).flair.Memory#10"],
-  // #9/#10 feed confirmCommittedRow and #11 the post-commit verifyWrittenRow: committed-row reads only.
   ["Memory", "alias-source:(databases as any).flair.Memory#11"],
+  ["Memory", "alias-source:(databases as any).flair.Memory#12"],
   // The write-lock store handle (flair#2478) — a read of primaryStore, never a write.
   ["Memory", "alias-source:(databases as any)?.flair?.Memory#1"],
   ["AdminMemory", "alias-source:(databases as any).flair.Memory#1"],

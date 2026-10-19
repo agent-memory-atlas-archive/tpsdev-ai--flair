@@ -395,10 +395,68 @@ export async function writeBackCommittedRow(
   }
 }
 
-// Harper assigns these timestamps; they are not staged application fields.
-const HARPER_MANAGED_FIELDS = ["__createdtime__", "__updatedtime__"] as const;
+/** The committed store's answer to a post-commit verification. */
+export type CommittedWriteVerdict = "shown" | "mismatch" | "unreadable";
 
-/** Compare staged values. */
+/**
+ * Does `committed` show the write `identity` describes with every `fields`
+ * entry at its staged value? The identity check is {@link sameStoredRow}.
+ */
+export function committedShowsFields(committed: any, identity: any, fields: Record<string, unknown>): boolean {
+  return sameStoredRow(committed, identity) &&
+    Object.entries(fields).every(([field, value]) => isDeepStrictEqual(committed?.[field], value));
+}
+
+/**
+ * Read `id` in a fresh committed context (never contextless) and report whether
+ * it shows the write: the row is still `identity`'s row and every named field
+ * holds its staged value. A failed read is `unreadable`, never `shown`.
+ *
+ * The post-commit shape a writer outside {@link writeBackCommittedRow} uses:
+ * after its owned transaction resolves, a newer write that committed in the
+ * final-confirmation-to-commit window may have discarded this write's effect
+ * while the commit still resolved (flair#2653, flair#2656).
+ *
+ * `also` re-checks a fact the decision depended on that is not one of the
+ * written fields — a re-embed's text basis, for instance.
+ */
+export async function verifyCommittedFields(
+  table: Pick<WriteBackTable, "get">,
+  id: string,
+  identity: any,
+  fields: Record<string, unknown>,
+  also?: (committed: any) => boolean,
+): Promise<CommittedWriteVerdict> {
+  let committed: any;
+  try {
+    committed = await table.get(id, {});
+  } catch {
+    return "unreadable";
+  }
+  if (committed == null) return "mismatch";
+  return (also === undefined || also(committed)) && committedShowsFields(committed, identity, fields) ? "shown" : "mismatch";
+}
+
+// Harper assigns these timestamps; they are not staged application fields.
+export const HARPER_MANAGED_FIELDS = ["__createdtime__", "__updatedtime__"] as const;
+
+/**
+ * A copy of `row` without {@link HARPER_MANAGED_FIELDS}: the application fields
+ * of a row staged by spreading a stored row, as the `fields` a caller hands
+ * {@link verifyCommittedFields}. Every other field is kept; `row` is unchanged.
+ */
+export function withoutHarperManagedFields(row: Record<string, unknown>): Record<string, unknown> {
+  const fields: Record<string, unknown> = { ...row };
+  for (const field of HARPER_MANAGED_FIELDS) delete fields[field];
+  return fields;
+}
+
+/**
+ * Does the committed row show this attempt's write? Its identity is the row
+ * this attempt wrote (an update keeps the basis's identity); each field the
+ * plan wrote holds its staged value, and a non-idempotent plan is confirmed by
+ * this attempt's commit marker (`writeId`), not by value equality.
+ */
 function committedShowsWrite(committed: any, basis: any, decision: WriteBackPlan, writeId?: string): boolean {
   if ("skip" in decision) return true;
   if (!decision.idempotent && committed?.[decision.commitMarkerField] !== writeId) return false;

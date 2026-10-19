@@ -22,7 +22,8 @@
  * (resources/write-back.ts) before the commit, and the stored key is read back
  * AFTER the commit. The lock serializes registrations for that agent within one
  * Harper process; raw operations-API writes and other processes do not take it.
- * A change committed after confirmation and before commit is not seen; a commit-time pending check is a follow-up.
+ * The post-commit read-back detects surviving differences in compared fields
+ * or identity; a commit-time pending check is a follow-up.
  * The response is returned only when the read-back is equal.
  *
  * Accepted credentials: Basic admin or a verified Ed25519 agent with the admin
@@ -34,7 +35,7 @@ import { isDeepStrictEqual } from "node:util";
 import { resolveAgentAuth } from "./agent-auth.js";
 import { withKeyLock } from "./key-lock.js";
 import { withOwnedTransaction } from "./request-transaction.js";
-import { CommittedRowChanged, confirmCommittedRow } from "./write-back.js";
+import { CommittedRowChanged, confirmCommittedRow, verifyCommittedFields } from "./write-back.js";
 import { txnPausePoint } from "./txn-pause-point.js";
 import { isPrincipalDeactivated } from "../src/lib/principal-status.js";
 import { isForeignAgentHome, isSyncOriginatedAgentRow } from "../src/lib/agent-home-fields.js";
@@ -60,8 +61,8 @@ const LOCK_NAMESPACE = "flair-agent-key-register";
 const LOCK_ATTEMPTS = 40;
 const LOCK_WAIT_MS = 25;
 
-const jsonRefusal = (status: number, error: string, message: string): Response =>
-  new Response(JSON.stringify({ error, message }), { status, headers: { "content-type": "application/json" } });
+const jsonRefusal = (status: number, error: string, message: string, outcome?: "conflict" | "unconfirmed"): Response =>
+  new Response(JSON.stringify({ error, message, ...(outcome ? { outcome } : {}) }), { status, headers: { "content-type": "application/json" } });
 
 /** Read a header off either header-object shape Harper hands us. */
 function readHeader(reqLike: any, name: string): string {
@@ -186,14 +187,20 @@ export class AgentKeyRegister extends Resource {
               const row = asRow(committed);
               return row !== null && isDeepStrictEqual({ ...row }, basis);
             });
-            return { kind: "registered" as const, registrationId, updatedAt: now };
+            // Test-only: inert unless the fault-injection env opt-in is set and
+            // armed. Holds the registration after its final pre-commit
+            // confirmation and before its owned transaction commits, the window
+            // where a newer write can discard this write's effect (flair#2656).
+            const commitPause = txnPausePoint("agent-key-register-commit");
+            if (commitPause) await commitPause;
+            return { kind: "registered" as const, registrationId, updatedAt: now, basis };
           }),
         LOCK_ATTEMPTS,
         LOCK_WAIT_MS,
       );
     } catch (err) {
       if (err instanceof CommittedRowChanged) {
-        return jsonRefusal(409, REGISTRATION_CONFLICT, "the agent row changed while the key was being registered; nothing was changed");
+        return jsonRefusal(409, REGISTRATION_CONFLICT, "the agent row changed while the key was being registered; nothing was changed", "conflict");
       }
       // Constant format string + a structured data object (unsafe-formatstring).
       console.error("[agent-key-register] the registration transaction failed; nothing was changed", { agentId, err });
@@ -232,18 +239,30 @@ export class AgentKeyRegister extends Resource {
     const readBackPause = txnPausePoint("agent-key-register-read-back");
     if (readBackPause) await readBackPause;
 
-    let readBack: Record<string, any> | null;
+    // The registration is NON-IDEMPOTENT: it transitions a pending key once and
+    // writes a fresh audit row per attempt. Re-planning from a fresh read is
+    // unsafe after an unconfirmed commit: it can write another audit row. This
+    // handler does not retry; a post-commit mismatch or an unreadable read-back
+    // is answered 503 with outcome `unconfirmed`. Its commit is
+    // confirmed by commit-specific evidence — the AgentKeyRegistration row this
+    // attempt wrote under `registrationId` — together with the staged Agent
+    // fields; value equality alone does not name the attempt that committed.
+    const readBackVerdict = await verifyCommittedFields(table, agentId, value.basis, { publicKey: registered, updatedAt: value.updatedAt });
+    let registrationRow: any;
+    let registrationReadable = true;
     try {
-      readBack = asRow(await table.get(agentId, {}));
-    } catch (err) {
-      console.error("[agent-key-register] the read-back of the committed key failed", { agentId, err });
-      return jsonRefusal(503, REGISTRATION_UNAVAILABLE, "the committed key could not be read back; the stored state is unconfirmed");
+      registrationRow = await audit.get(value.registrationId, {});
+    } catch {
+      registrationReadable = false;
     }
-    if (readBack === null || readBack.publicKey !== registered || readBack.updatedAt !== value.updatedAt) {
-      return jsonRefusal(503, REGISTRATION_UNAVAILABLE, "the committed key could not be read back equal to the registered key; the stored state is unconfirmed");
+    if (readBackVerdict === "unreadable" || !registrationReadable) {
+      return jsonRefusal(503, REGISTRATION_UNAVAILABLE, "the committed key or its registration audit row could not be read back; the stored state is unconfirmed", "unconfirmed");
+    }
+    if (readBackVerdict !== "shown" || registrationRow == null || registrationRow.agentId !== agentId) {
+      return jsonRefusal(503, REGISTRATION_UNAVAILABLE, "the committed key could not be read back as this registration's row and audit; the stored state is unconfirmed", "unconfirmed");
     }
     return new Response(
-      JSON.stringify({ agentId, publicKey: readBack.publicKey, updatedAt: readBack.updatedAt, registrationId: value.registrationId }),
+      JSON.stringify({ agentId, publicKey: registered, updatedAt: value.updatedAt, registrationId: value.registrationId }),
       { status: 200, headers: { "content-type": "application/json" } },
     );
   }
