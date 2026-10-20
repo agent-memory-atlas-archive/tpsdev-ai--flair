@@ -82,8 +82,15 @@ the same reason, that component's application tools (`get_`, `search_`,
 `create_`, `update_`, `delete_`) are resolved, wherever flair resolves a
 caller, as a caller without a valid credential, administrators included.
 
-Flair's local installs run Harper with MQTT off. When an operator turns MQTT
-on, an exported table's path is also an MQTT topic (`<Table>/#`,
+Flair's local installs run Harper with MQTT off. For a component deployment,
+`flair deploy` and `flair upgrade --target` by default set MQTT off in the
+target's configuration, request the shared worker threads' restart that
+applies it for an isolated application, and read the saved configuration back
+after the deploy's restart (`--keep-mqtt-config` skips all of it;
+`--no-restart` and `--no-verify` skip the restart request and the read-back);
+they do not probe the listeners
+([deploying-on-fabric.md](deploying-on-fabric.md#mqtt-configuration)). When an
+operator turns MQTT on, an exported table's path is also an MQTT topic (`<Table>/#`,
 `<Table>/<id>`) — except a path that a resource other than the table serves
 (`AgentReadPosition`, `OAuthToken`), which follows that resource's own rules.
 On a table topic, these MQTT actions are served to administrators and trusted
