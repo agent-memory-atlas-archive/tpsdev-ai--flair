@@ -415,6 +415,25 @@ export class AgentFleet extends Resource {
         return run(() => registerAgent(body));
       case "remember":
         return run(() => remember(body.agentId, body));
+      case "putAgent":
+        // flair#2696 — an Agent PUT the way an embedding app's provisioning code
+        // calls it: through the Agent resource bound to a trusted internal
+        // context, as a collection resource with NO URL target, so the body
+        // `id` names the row.
+        return run(async () => {
+          const h = await collectionResource(flair("Agent"), internalContext());
+          return h.put(body.record);
+        });
+      case "seedAgent":
+        // flair#2696 — AgentSeed called in-process through a collection
+        // resource. `marker: true` uses internalContext() (the deliberate
+        // trusted internal call); `marker: false` passes an explicit context
+        // that lacks the internal marker.
+        return run(async () => {
+          const ctx = body.marker === true ? internalContext() : { request: {} };
+          const h = await collectionResource(flair("AgentSeed"), ctx);
+          return h.post(body.seed);
+        });
       case "postMemory":
         return run(async () => {
           const h = await collectionResource(flair("Memory"), agentContext(body.agentId));
