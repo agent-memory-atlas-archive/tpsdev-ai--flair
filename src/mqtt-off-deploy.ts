@@ -392,8 +392,14 @@ export async function applyMqttOffConfiguration(o: OpsTarget & {
         `or pass --keep-mqtt-config to deploy without changing the target's MQTT configuration.`,
     );
   }
-  o.onProgress?.(`MQTT listeners set off in the configuration of ${shown}${replicated ? " and its cluster nodes" : ""}`);
-  return { peers: replicated ? replicatedNodes(parsed) : [] };
+  // Step 1 accepts an answer without a node list (the origin's own answer still
+  // confirms the write); our replicated restart-job check rejects a result
+  // without a node-list array. Add the cluster phrase only when the answer
+  // lists nodes, so this line and the final report agree on whether the
+  // answer listed cluster nodes.
+  const peers = replicated ? replicatedNodes(parsed) : [];
+  o.onProgress?.(`MQTT listeners set off in the configuration of ${shown}${peers.length > 0 ? " and its cluster nodes" : ""}`);
+  return { peers };
 }
 
 /** The restart an operator sends when the channel's own restart request failed or was not made. */
