@@ -17,7 +17,7 @@ import { existsSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 
 import { dirname, resolve } from "node:path";
 import * as render from "../render.js";
-import { isLocalBase, resolveAdminUser, resolveLocalAdminPass, resolveAdminPassFromSources, AdminPassSourceError, ADMIN_PASS_FILE_FLAG, ADMIN_PASS_FILE_HELP, ADMIN_PASS_FLAG, ADMIN_PASS_HELP, apiErrorRawBody, boundErrorText } from "../lib/auth-resolve.js";
+import { isLocalBase, resolveAdminUser, resolveLocalAdminPass, resolveAdminPassFromSources, AdminPassSourceError, ADMIN_PASS_FILE_FLAG, ADMIN_PASS_FILE_HELP, ADMIN_PASS_FLAG, ADMIN_PASS_HELP, ApiRequestOutcomeUnknown, apiErrorRawBody, boundErrorText, resolveRemRequestDeadlineMs, DEFAULT_REM_REQUEST_DEADLINE_MS } from "../lib/auth-resolve.js";
 import type { OpsSearch } from "../rem/runner.js";
 import {
   validatePromoteOpts,
@@ -63,6 +63,48 @@ export type RemCli = {
 };
 
 let cli: RemCli;
+
+/** The REM work routes that share {@link REM_WORK_REQUEST_DEADLINE_MS}. */
+const REM_WORK_ROUTES: ReadonlySet<string> = new Set([
+  "/MemoryMaintenance",
+  "/ReflectMemories",
+  "/MemoryDedupStats",
+  "/AutoPromoteCandidates",
+]);
+
+/**
+ * The single whole-request deadline for every REM work route: POST
+ * /MemoryMaintenance, POST /ReflectMemories, POST /MemoryDedupStats and POST
+ * /AutoPromoteCandidates. Its sizing basis is documented on
+ * {@link DEFAULT_REM_REQUEST_DEADLINE_MS}. FLAIR_REM_REQUEST_TIMEOUT_MS
+ * overrides it and is read only for these four routes, so an invalid value of
+ * that variable refuses only those requests, before they are sent. Every other
+ * request through the shared REST sender that passes no explicit deadline
+ * resolves FLAIR_REQUEST_TIMEOUT_MS, else the shared default; an explicit
+ * deadline is validated and returned before that variable is read, so an
+ * invalid value of it does not refuse a request that passes one.
+ */
+export const REM_WORK_REQUEST_DEADLINE_MS = DEFAULT_REM_REQUEST_DEADLINE_MS;
+
+/**
+ * `{ deadlineMs, deadlineSource }` for every REM work route, `{}` for every
+ * other request. The new-variable value is resolved per call, so an invalid
+ * FLAIR_REM_REQUEST_TIMEOUT_MS is refused for these routes before the request
+ * is sent. The source travels with the deadline so its expiry names the
+ * variable that governs it, whether the value came from the variable or the
+ * default.
+ */
+export function longRemRequestDeadline(
+  method: string,
+  path: string,
+  env: NodeJS.ProcessEnv = process.env,
+): { deadlineMs?: number; deadlineSource?: "rem" } {
+  if (method !== "POST") return {};
+  if (REM_WORK_ROUTES.has(path)) {
+    return { deadlineMs: resolveRemRequestDeadlineMs(env), deadlineSource: "rem" };
+  }
+  return {};
+}
 
 /** Bind shared CLI helpers. cli.ts calls this immediately before register(program). */
 export function bindCli(fns: RemCli): void {
@@ -488,10 +530,10 @@ export function describeReflectError(err: unknown): { kind: "no-backend" | "dist
   return { kind: "other", text: message };
 }
 
-/** Print skips and errors; errors alone set exit 1. */
-export function summarizeNightlyOutcome(row: { errors: string[]; skips: string[] }): {
+/** Print skips, unknown outcomes and errors; errors alone set exit 1, an unknown outcome exit 3. */
+export function summarizeNightlyOutcome(row: { errors: string[]; skips: string[]; outcomeUnknown?: string[] }): {
   lines: string[];
-  exitCode: 0 | 1;
+  exitCode: 0 | 1 | 3;
 } {
   const lines: string[] = [];
   if (row.errors.length > 0) {
@@ -502,10 +544,30 @@ export function summarizeNightlyOutcome(row: { errors: string[]; skips: string[]
     lines.push("Skips:");
     for (const s of row.skips) lines.push(`  - ${s}`);
   }
-  return { lines, exitCode: row.errors.length > 0 ? 1 : 0 };
+  if (row.outcomeUnknown && row.outcomeUnknown.length > 0) {
+    lines.push("Unknown outcome:");
+    for (const u of row.outcomeUnknown) lines.push(`  - ${u}`);
+    lines.push("  These writes may or may not have taken effect. Inspect what was staged before re-running this cycle, once the server has settled.");
+  }
+  // Exit 3 for an unknown write outcome, as `flair memory verify` and
+  // `memory compare-nodes` use 3 for "unknown": distinct from the 1 an
+  // ordinary failure exits with.
+  const exitCode = (row.outcomeUnknown?.length ?? 0) > 0 ? 3 : row.errors.length > 0 ? 1 : 0;
+  return { lines, exitCode };
 }
 
 const REM_PAUSE_FLAG = resolve(resolveHome(), ".flair", "rem.paused");
+
+/**
+ * Print a write's unknown outcome and exit 3, the CLI's "unknown" code (as
+ * `flair memory verify` uses it), distinct from the 1 an ordinary failure
+ * exits with.
+ */
+export function exitUnknownOutcome(err: ApiRequestOutcomeUnknown): never {
+  console.error(`Unknown outcome: ${err.message}`);
+  console.error(`The request may or may not have taken effect; inspect the target before re-running.`);
+  process.exit(3);
+}
 
 function writeRemPauseSentinel(): void {
   const dir = dirname(REM_PAUSE_FLAG);
@@ -539,7 +601,7 @@ export function register(program: Command): void {
         const maint = await api("POST", "/MemoryMaintenance", {
           ...(agentId ? { agentId } : {}),
           dryRun,
-        });
+        }, longRemRequestDeadline("POST", "/MemoryMaintenance"));
 
         if (maint.error) {
           console.error(`Maintenance error: ${maint.error}`);
@@ -592,6 +654,7 @@ export function register(program: Command): void {
 
         console.log(`\nDone.${dryRun ? " No changes applied (dry run)." : ""}`);
       } catch (err: any) {
+        if (err instanceof ApiRequestOutcomeUnknown) exitUnknownOutcome(err);
         console.error(`Error: ${err.message}`);
         process.exit(1);
       }
@@ -629,7 +692,7 @@ export function register(program: Command): void {
       if (opts.promptOnly) {
         // --prompt-only: EXACT pre-#710 behavior — prompt-return mode, unchanged.
         try {
-          const result = await api("POST", "/ReflectMemories", body);
+          const result = await api("POST", "/ReflectMemories", body, longRemRequestDeadline("POST", "/ReflectMemories"));
 
           if (result.error) {
             console.error(`Reflection error: ${result.error}`);
@@ -647,6 +710,7 @@ export function register(program: Command): void {
           console.log("Feed the prompt above to your LLM, then write insights back with:");
           console.log("  flair memory add --agent <id> --content <insight> --durability persistent --derived-from <source-ids>");
         } catch (err: any) {
+          if (err instanceof ApiRequestOutcomeUnknown) exitUnknownOutcome(err);
           console.error(`Error: ${err.message}`);
           process.exit(1);
         }
@@ -655,7 +719,7 @@ export function register(program: Command): void {
 
       // Default: execute mode — distill server-side, stage candidates.
       try {
-        const result = await api("POST", "/ReflectMemories", { ...body, execute: true });
+        const result = await api("POST", "/ReflectMemories", { ...body, execute: true }, longRemRequestDeadline("POST", "/ReflectMemories"));
         const candidates: any[] = Array.isArray(result.candidates) ? result.candidates : [];
 
         console.log(`\nModel:      ${result.model ?? "?"}`);
@@ -666,6 +730,7 @@ export function register(program: Command): void {
         }
         console.log(`\nreview: flair rem candidates / flair rem promote <id>`);
       } catch (err: any) {
+        if (err instanceof ApiRequestOutcomeUnknown) exitUnknownOutcome(err);
         const desc = describeReflectError(err);
         if (desc.kind === "no-backend") {
           console.error(`Reflection error: ${desc.text}`);
@@ -699,7 +764,7 @@ export function register(program: Command): void {
         const maint = await api("POST", "/MemoryMaintenance", {
           ...(agentId ? { agentId } : {}),
           dryRun,
-        });
+        }, longRemRequestDeadline("POST", "/MemoryMaintenance"));
 
         if (maint.error) {
           console.error(`Maintenance error: ${maint.error}`);
@@ -744,7 +809,7 @@ export function register(program: Command): void {
           const reflect = await api("POST", "/ReflectMemories", {
             agentId,
             scope: "all",
-          });
+          }, longRemRequestDeadline("POST", "/ReflectMemories"));
 
           if (reflect.error) {
             console.error(`Reflection error: ${reflect.error}`);
@@ -765,6 +830,7 @@ export function register(program: Command): void {
 
         console.log(`\nRestorative cycle complete.${dryRun ? " No changes applied (dry run)." : ""}`);
       } catch (err: any) {
+        if (err instanceof ApiRequestOutcomeUnknown) exitUnknownOutcome(err);
         console.error(`Error: ${err.message}`);
         process.exit(1);
       }
@@ -1029,6 +1095,7 @@ export function register(program: Command): void {
         }
         console.log(`✅ Candidate ${candidateId} marked promoted → ${opts.to}, reviewer=${reviewerId}`);
       } catch (err: any) {
+        if (err instanceof ApiRequestOutcomeUnknown) exitUnknownOutcome(err);
         console.error(`Error: ${err.message}`);
         process.exit(1);
       }
@@ -1083,6 +1150,7 @@ export function register(program: Command): void {
         console.log(`✅ Candidate ${candidateId} rejected by ${reviewerId}`);
         console.log(`   Reason: ${opts.reason}`);
       } catch (err: any) {
+        if (err instanceof ApiRequestOutcomeUnknown) exitUnknownOutcome(err);
         console.error(`Error: ${err.message}`);
         process.exit(1);
       }
@@ -1206,7 +1274,7 @@ export function register(program: Command): void {
         console.error("Error: --agent or FLAIR_AGENT_ID env required");
         process.exit(1);
       }
-      const { runNightlyCycle, formatPendingCandidates, formatCount, formatAutoPromoted } = await import("../rem/runner.js");
+      const { runNightlyCycle, RunnerLogWriteError, formatPendingCandidates, formatCount, formatAutoPromoted } = await import("../rem/runner.js");
       // The runner is agent-authed and cannot reach the ops port itself. When
       // admin credentials are available, inject ops-API and admin-authed REST
       // helpers so the pending-candidate count and the admin-gated dedup step
@@ -1236,11 +1304,23 @@ export function register(program: Command): void {
       // signedOnly refuses FLAIR_TOKEN / FLAIR_ADMIN_PASS / the local
       // admin-pass file. A selected agent with no key is refused, not
       // silently replaced by an ambient credential.
+      //
+      // The REM work calls can legitimately outrun the shared default:
+      // maintenance scans its scoped rows with no run row cap, reflection
+      // waits on a generative backend, the auto-promote sweep carries up to
+      // DEFAULT_MAX_AUTO_PROMOTE_PER_CYCLE promotions, and the instance-wide
+      // dedup sweep is sized from the fixture's 23.07 s over 403 live vectors
+      // (test/bench/rem-responsiveness.md). All four REM work routes get the
+      // one 1,800 s deadline from longRemRequestDeadline,
+      // FLAIR_REM_REQUEST_TIMEOUT_MS overrides it, and every other call
+      // through the shared REST sender that passes no explicit deadline
+      // resolves FLAIR_REQUEST_TIMEOUT_MS when it is set, else the default.
+      const remDeadline = longRemRequestDeadline;
       const agentApiCall = (method: string, path: string, body?: unknown) =>
-        api(method, path, body, { agentId, agentIdSource: "flag", signedOnly: true });
+        api(method, path, body, { agentId, agentIdSource: "flag", signedOnly: true, ...remDeadline(method, path) });
       const adminApiCall = adminPass
         ? (method: string, path: string, body?: unknown) =>
-            api(method, path, body, { explicitAdminPass: adminPass, adminUser: opts.adminUser, agentId: null })
+            api(method, path, body, { explicitAdminPass: adminPass, adminUser: opts.adminUser, agentId: null, ...remDeadline(method, path) })
         : undefined;
       const opsSearch = adminPass
         ? buildOpsSearch({ opsPort: resolveOpsPort(opts), adminUser: opts.adminUser, adminPass })
@@ -1319,7 +1399,7 @@ export function register(program: Command): void {
           console.log(`\nNote: REM refused to start because /Health could not be served.`);
           console.log(`Restore /Health before retrying, or \`flair rem pause\` to stop the scheduler.`);
         }
-        if (row.errors.length > 0 || row.skips.length > 0) {
+        if (row.errors.length > 0 || row.skips.length > 0 || (row.outcomeUnknown?.length ?? 0) > 0) {
           const outcome = summarizeNightlyOutcome(row);
           for (const line of outcome.lines) console.log(line);
           if (outcome.exitCode !== 0) process.exit(outcome.exitCode);
@@ -1329,6 +1409,13 @@ export function register(program: Command): void {
           console.log(`Resume with: flair rem resume`);
         }
       } catch (err: any) {
+        if (err instanceof RunnerLogWriteError && (err.row.outcomeUnknown?.length ?? 0) > 0) {
+          console.log(`Status:     ${err.row.status}`);
+          const outcome = summarizeNightlyOutcome(err.row);
+          for (const line of outcome.lines) console.log(line);
+          console.error(`Log write failed: ${err.message}`);
+          process.exit(3);
+        }
         console.error(`Error: ${err.message}`);
         process.exit(1);
       }
@@ -1423,7 +1510,7 @@ export function register(program: Command): void {
 
       // --apply path: live replay via src/rem/restore.ts
       if (opts.apply) {
-        const { applySnapshot } = await import("../rem/restore.js");
+        const { applySnapshot, formatUnknownState } = await import("../rem/restore.js");
         applyAdminPassFile(opts);
         let restoreTarget: RestoreTarget;
         try {
@@ -1501,11 +1588,39 @@ export function register(program: Command): void {
           if (result.retried.memories.length > 0) {
             console.log(`  Retried:      ${result.retried.memories.length} memories (${result.retried.memories.join(", ")})`);
           }
+          const unknownCount =
+            result.unknown.memories.length + result.unknown.souls.length + result.unknown.candidates.length;
+          if (unknownCount > 0) {
+            console.log(`  Unknown:      ${unknownCount} ids ended at the request deadline; their write may or may not have taken effect, and no later write to the same table and record id was sent`);
+            for (const id of result.unknown.memories) {
+              const state = result.verified?.unknownStates.find((s) => s.entity === "memory" && s.id === id);
+              console.log(`    - ${state ? formatUnknownState(state) : `memory ${id}: post-restore verification did not complete; its state is unverified`}`);
+            }
+            for (const id of result.unknown.souls) {
+              const state = result.verified?.unknownStates.find((s) => s.entity === "soul" && s.id === id);
+              console.log(`    - ${state ? formatUnknownState(state) : `soul ${id}: post-restore verification did not complete; its state is unverified`}`);
+            }
+            for (const id of result.unknown.candidates) {
+              console.log(`    - MemoryCandidate ${id}: verification does not read candidates back; its state is unverified`);
+            }
+            if (result.skippedAfterUnknownDelete.memories.length + result.skippedAfterUnknownDelete.souls.length > 0) {
+              const ids = [...result.skippedAfterUnknownDelete.memories, ...result.skippedAfterUnknownDelete.souls];
+              console.log(`    - not written again after an unknown write to the same table and record id: ${ids.join(", ")} (a late write could still change the row)`);
+            }
+            if (!result.verified) {
+              console.log(`    - memory and soul state not checked: post-restore verification did not complete`);
+            }
+            console.log(`  Re-run once the server has settled: \`flair rem restore ${date} --agent ${agentId} --apply\` (restore is re-runnable).`);
+          }
           if (result.errors.length > 0) {
             console.log(`  Errors:`);
             for (const e of result.errors) console.log(`    - ${e}`);
           }
           if (result.status === "failed") process.exit(1);
+          // Exit 3 for an unknown write outcome, as `flair memory verify` and
+          // `memory compare-nodes` use 3 for "unknown": distinct from the 1 an
+          // ordinary restore failure exits with.
+          if (result.status === "unresolved") process.exit(3);
         } catch (err: any) {
           console.error(`Error: ${err.message}`);
           process.exit(1);

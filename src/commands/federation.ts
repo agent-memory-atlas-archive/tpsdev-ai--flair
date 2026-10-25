@@ -35,6 +35,7 @@ import {
   isLocalBase,
   resolveAdminPassFromSources,
   resolveAdminUser,
+  ApiRequestOutcomeUnknown,
   ADMIN_PASS_FILE_FLAG,
   ADMIN_PASS_FILE_HELP,
   ADMIN_PASS_FLAG,
@@ -2551,6 +2552,7 @@ export function register(program: Command): void {
       // DELETE which requires admin auth.
       let deleted = 0;
       let errors = 0;
+      let unknown = 0;
       for (const p of candidates) {
         try {
           const res = await api("DELETE", `/FederationPeers/${encodeRecordId(p.id)}`, undefined, baseUrl ? { baseUrl } : undefined);
@@ -2564,11 +2566,23 @@ export function register(program: Command): void {
             console.log(`Failed to delete ${p.id}: ${JSON.stringify(res)}`);
           }
         } catch (e: any) {
+          if (e instanceof ApiRequestOutcomeUnknown) {
+            // An expired request is reported as an unknown outcome, like every
+            // other non-GET/HEAD request through the shared REST sender: the client cannot tell
+            // whether the server acted. Count it apart from a definite failure
+            // and exit 3 for it (unknown outranks a known failure, as rem's
+            // `unresolved` does). The route this DELETE targets cannot accept
+            // it; that route defect is #2868, outside this change.
+            unknown++;
+            console.log(`Unknown outcome for ${p.id}: ${e.message}`);
+            continue;
+          }
           errors++;
           console.log(`Failed to delete ${p.id}: ${e.message}`);
         }
       }
-      console.log(`${deleted} peer(s) deleted; ${errors} error(s).`);
+      console.log(`${deleted} peer(s) deleted; ${errors} error(s); ${unknown} unknown outcome(s).`);
+      if (unknown > 0) process.exit(3);
       if (errors > 0) process.exit(1);
     });
 
