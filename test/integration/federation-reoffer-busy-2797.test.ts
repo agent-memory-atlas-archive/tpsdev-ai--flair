@@ -18,9 +18,9 @@
  * Two real, ephemeral, loopback, HOME-isolated Harpers. Fixtures are neutral
  * (`agent-a`, `flair_spoke_a`, `flair_hub_a`).
  */
-import { afterAll, beforeAll, describe, expect, it, mock } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, mock } from "bun:test";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import nacl from "tweetnacl";
@@ -89,10 +89,117 @@ async function clearRetries(): Promise<void> {
   }
 }
 
+/** Put the sender's cursor at `at`. */
+async function setCursor(at: Date): Promise<void> {
+  const iso = at.toISOString();
+  await ops(sender, { operation: "update", table: "Peer", records: [{ id: HUB_ID, lastSyncAt: iso, updatedAt: iso }] });
+}
+
 /** Put the sender's cursor ahead of every row already on the instance. */
 async function setCursorNow(): Promise<void> {
-  const now = new Date().toISOString();
-  await ops(sender, { operation: "update", table: "Peer", records: [{ id: HUB_ID, lastSyncAt: now, updatedAt: now }] });
+  await setCursor(new Date());
+}
+
+/** Put the sender's cursor an hour back, so rows written now are past it. */
+async function setCursorBehindRows(): Promise<void> {
+  await setCursor(new Date(Date.now() - 3_600_000));
+}
+
+/** Delete every row of `table` on `h`, so an earlier case's row cannot be selected. */
+async function clearTable(h: HarperInstance, table: string): Promise<void> {
+  const rows = await ops(h, { operation: "sql", sql: `SELECT * FROM flair.${table}` });
+  for (const row of (Array.isArray(rows) ? rows : (rows?.results ?? [])) as any[]) {
+    await deleteRow(h, table, row.id);
+  }
+}
+
+const MERGE_PAUSE = "federation-merge";
+
+/**
+ * How long cleanup waits for the pause point to record its result. A fixed
+ * bound, so a release that is never acknowledged fails the case rather than
+ * hanging it.
+ */
+const RELEASE_ACK_BOUND_MS = 10_000;
+
+/**
+ * The result the pause point recorded for `point`: `"go"` or `"timeout"` once
+ * its wait has ended, null before that. It creates `released.<point>` empty
+ * before waiting and writes the result afterwards
+ * (resources/txn-pause-point.ts), so the file's content — not its existence —
+ * is the completion signal.
+ */
+function pauseResult(point: string): string | null {
+  try {
+    const result = readFileSync(join(pauseDir, `released.${point}`), "utf8");
+    return result.length > 0 ? result : null;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+/**
+ * Wait, bounded, until the pause point has created `released.<point>` empty.
+ * It creates `paused` before `released`, so `paused` alone does not mean the
+ * release marker exists yet.
+ */
+async function waitForEmptyRelease(point: string): Promise<void> {
+  const deadline = Date.now() + RELEASE_ACK_BOUND_MS;
+  for (;;) {
+    try {
+      if (readFileSync(join(pauseDir, `released.${point}`), "utf8").length === 0) return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`the ${point} pause did not create its release marker within ${RELEASE_ACK_BOUND_MS}ms`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+function markerExists(name: string): boolean {
+  try {
+    readFileSync(join(pauseDir, name));
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+/**
+ * Release a pause an earlier case may still hold and remove every marker this
+ * file arms. Both Harpers share one pause directory, and the pause point opens
+ * its `claimed`/`paused`/`released` files with O_EXCL: a leftover marker makes
+ * the next arm inert, while a leftover arm pauses the next push.
+ *
+ * A pause the case claimed may still be waiting, so `go` stays in place until
+ * the pause point records its result in `released`; only then are the markers
+ * removed.
+ */
+async function resetPauseMarkers(): Promise<void> {
+  writeFileSync(join(pauseDir, `go.${MERGE_PAUSE}`), "");
+  if (markerExists(`claimed.${MERGE_PAUSE}`) && pauseResult(MERGE_PAUSE) === null) {
+    const deadline = Date.now() + RELEASE_ACK_BOUND_MS;
+    while (pauseResult(MERGE_PAUSE) === null) {
+      if (Date.now() >= deadline) {
+        throw new Error(`did not observe the ${MERGE_PAUSE} pause release within ${RELEASE_ACK_BOUND_MS}ms`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+  for (const name of [
+    `arm.${MERGE_PAUSE}`,
+    `claimed.${MERGE_PAUSE}`,
+    `paused.${MERGE_PAUSE}`,
+    `go.${MERGE_PAUSE}`,
+    `released.${MERGE_PAUSE}`,
+    "fail.federation-synclog",
+  ]) {
+    rmSync(join(pauseDir, name), { force: true });
+  }
 }
 
 function retryRow(recordId: string, lastReason: string, over: Record<string, unknown> = {}): Record<string, unknown> {
@@ -216,7 +323,21 @@ afterAll(async () => {
 }, HARPER_STOP_BUDGET_MS * 2 + 60_000);
 
 describe("flair#2797 — a merge_target_busy refusal is re-offered after the lock clears", () => {
+  beforeEach(async () => {
+    await resetPauseMarkers();
+    await clearTable(sender, "Memory");
+    await clearTable(receiver, "Memory");
+    await clearTable(receiver, "SyncLog");
+    await clearRetries();
+    await ops(sender, { operation: "update", table: "Peer", records: [{ id: HUB_ID, endpoint: receiver.httpURL, updatedAt: new Date().toISOString() }] });
+  }, 120_000);
+
+  afterEach(async () => {
+    await resetPauseMarkers();
+  }, 120_000);
+
   it("re-offers the refused row on the next sync, past the sender's cursor", async () => {
+    await setCursorBehindRows();
     const id = "memory-reoffer-a";
     const updatedAt = new Date(Date.now() - 120_000).toISOString();
     const fromSpoke = memoryRow(id, "from-spoke", updatedAt);
@@ -263,8 +384,8 @@ describe("flair#2797 — a merge_target_busy refusal is re-offered after the loc
   }, 420_000);
 
   it("a non-retryable refusal is not recorded and is not re-offered", async () => {
+    await setCursorBehindRows();
     const id = `memory.${randomBytes(3).toString("hex")}.content`;
-    // These cases share one sender; a row written now is past its cursor.
     const updatedAt = new Date().toISOString();
     await insertRow(sender, "Memory", memoryRow(id, "not-federated", updatedAt));
 
@@ -280,6 +401,7 @@ describe("flair#2797 — a merge_target_busy refusal is re-offered after the loc
   }, 240_000);
 
   it("the busy skip writes a SyncLog row naming its skippedReasons", async () => {
+    await setCursorBehindRows();
     const id = "memory-synclog-a";
     const updatedAt = new Date().toISOString();
     await insertRow(sender, "Memory", memoryRow(id, "logged", updatedAt));
@@ -305,6 +427,75 @@ describe("flair#2797 — a merge_target_busy refusal is re-offered after the loc
     expect(busy!.row.skippedCount, JSON.stringify(busy!.row)).toBe(1);
     expect(busy!.row.status, JSON.stringify(busy!.row)).toBe("partial");
   }, 300_000);
+
+  it("cleanup waits for a paused merge's release acknowledgement, and fails when it never arrives", async () => {
+    const at = new Date().toISOString();
+    const id = "memory-cleanup-ack";
+
+    // A real merge is inside the pause when cleanup starts: no `go` has been
+    // written, so the pause point has created `released` empty and not yet
+    // recorded a result.
+    writeFileSync(join(pauseDir, `arm.${MERGE_PAUSE}`), "");
+    const holder = push(memoryRow(id, "cleanup-ack-holder", at));
+    expect(await waitFor(join(pauseDir, `paused.${MERGE_PAUSE}`), 120_000), "the merge never paused").toBe(true);
+    expect(pauseResult(MERGE_PAUSE), "the pause recorded a result before cleanup started").toBeNull();
+    expect(markerExists(`claimed.${MERGE_PAUSE}`), "the pause never claimed the arm").toBe(true);
+
+    await resetPauseMarkers();
+    // Cleanup released the pause and only then removed the markers; the merge
+    // it held can now finish.
+    expect((await holder).status).toBe(200);
+    expect(markerExists(`released.${MERGE_PAUSE}`), "cleanup left the released marker").toBe(false);
+
+    // An outstanding pause that has not acknowledged holds cleanup open: it
+    // creates `released` empty and writes its result only when its wait ends.
+    writeFileSync(join(pauseDir, `claimed.${MERGE_PAUSE}`), "");
+    writeFileSync(join(pauseDir, `released.${MERGE_PAUSE}`), "");
+    let settled = false;
+    const pending = resetPauseMarkers().then(() => {
+      settled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    expect(settled, "cleanup resolved while the release was unacknowledged").toBe(false);
+    writeFileSync(join(pauseDir, `released.${MERGE_PAUSE}`), "go");
+    await pending;
+    expect(markerExists(`released.${MERGE_PAUSE}`), "cleanup left the released marker").toBe(false);
+
+    // Cleanup fails when it cannot observe the release acknowledgement. The
+    // pause keeps its own open descriptor, so removing the marker hides its
+    // result for good.
+    writeFileSync(join(pauseDir, `arm.${MERGE_PAUSE}`), "");
+    const stuck = push(memoryRow("memory-cleanup-ack-stuck", "stuck", at));
+    try {
+      await waitForEmptyRelease(MERGE_PAUSE);
+      rmSync(join(pauseDir, `released.${MERGE_PAUSE}`), { force: true });
+      const failingAt = Date.now();
+      let failure: unknown = null;
+      try {
+        await resetPauseMarkers();
+      } catch (error) {
+        failure = error;
+      }
+      const failedAfter = Date.now() - failingAt;
+      expect(failure, "cleanup resolved without the release acknowledgement").not.toBeNull();
+      expect(String(failure)).toContain(
+        `did not observe the ${MERGE_PAUSE} pause release within ${RELEASE_ACK_BOUND_MS}ms`,
+      );
+      expect(failedAfter).toBeGreaterThanOrEqual(RELEASE_ACK_BOUND_MS);
+      expect(failedAfter).toBeLessThan(RELEASE_ACK_BOUND_MS + 6_000);
+      expect((await stuck).status).toBe(200);
+    } finally {
+      for (const name of [
+        `arm.${MERGE_PAUSE}`,
+        `claimed.${MERGE_PAUSE}`,
+        `paused.${MERGE_PAUSE}`,
+        `go.${MERGE_PAUSE}`,
+        `released.${MERGE_PAUSE}`,
+      ]) {
+        rmSync(join(pauseDir, name), { force: true });
+      }
+    }
+  }, 240_000);
 
   it("a failed SyncLog write is reported in the response, not only logged", async () => {
     const id = "memory-synclog-unwritten";
@@ -372,7 +563,7 @@ describe("flair#2797 — a merge_target_busy refusal is re-offered after the loc
 
   it("a first indeterminate offer records a pending row before the cursor advances", async () => {
     await clearRetries();
-    await setCursorNow();
+    await setCursorBehindRows();
     const id = "memory-first-indeterminate";
     const updatedAt = new Date().toISOString();
     await insertRow(sender, "Memory", memoryRow(id, "first-indeterminate", updatedAt));
